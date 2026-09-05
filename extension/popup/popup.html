@@ -15,6 +15,7 @@
       <div id="setup" class="panel">
         <input id="test-name" type="text" placeholder="Test name (e.g. Cancel order)" />
         <button id="start-btn">Start Recording</button>
+        <button id="last-run-btn" class="link-btn hidden">View last run →</button>
       </div>
 
       <div id="recording" class="panel hidden">
@@ -22,23 +23,14 @@
         <ul id="action-list"></ul>
         <div class="row">
           <button id="mark-step-btn">Mark Step</button>
-          <button id="stop-btn">Stop &amp; Generate</button>
+          <button id="stop-btn">Stop &amp; Review</button>
         </div>
       </div>
 
-      <div id="generating" class="panel hidden">
-        <p>Generating &amp; verifying test with Claude…</p>
-      </div>
-
-      <div id="result" class="panel hidden">
-        <h3>AI-Generated Test</h3>
-        <div id="test-summary"></div>
-        <pre id="test-code"></pre>
-        <div id="heal-status"></div>
-        <div class="row">
-          <button id="copy-btn">Copy Code</button>
-          <button id="new-btn">New Recording</button>
-        </div>
+      <div id="sent" class="panel hidden">
+        <p>Recording stopped. Review &amp; annotate the steps in the new tab, then generate from there.</p>
+        <button id="open-run-btn">Open last results tab</button>
+        <button id="new-btn" class="link-btn">New recording</button>
       </div>
 
       <div id="error" class="panel hidden error-panel"></div>

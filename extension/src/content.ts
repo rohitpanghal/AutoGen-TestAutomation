@@ -145,11 +145,22 @@ function resolveLeafPrediction(ctx: {
   ariaLabel?: string;
   roleTextAmbiguous: boolean;
   tag: string;
+  name?: string;
+  nameAmbiguous: boolean;
+  type?: string;
   nearbyText?: string;
   textTruncated: boolean;
   xpathIsAnchored: boolean;
 }): LeafPrediction {
   if (ctx.testId && !ctx.testIdAmbiguous) return { needsScope: false };
+  if (
+    ['input', 'select', 'textarea'].includes(ctx.tag) &&
+    !['radio', 'checkbox'].includes(ctx.type ?? '') &&
+    ctx.name &&
+    !ctx.nameAmbiguous
+  ) {
+    return { needsScope: false };
+  }
   if (ctx.role && (ctx.text || ctx.ariaLabel) && !ctx.roleTextAmbiguous) return { needsScope: false };
   if (['input', 'select', 'textarea'].includes(ctx.tag) && ctx.nearbyText) return { needsScope: false };
   if (ctx.text) {
@@ -264,10 +275,10 @@ function getImplicitRole(el: Element): string | undefined {
 // innerText reflects only RENDERED text -- the browser returns "" for an
 // element with no layout box (display:none, the exact CSS a responsive
 // desktop/mobile nav pair uses to hide one copy), so scanning by innerText
-// alone makes a hidden duplicate invisible to every uniqueness check in this
-// file (getContainerHint's countHasTextMatches and getLandmark's
-// landmarkVerifies included, not just this one). textContent doesn't have
-// that blind spot.
+// alone makes a hidden duplicate invisible to getLandmark's landmarkVerifies.
+// textContent doesn't have that blind spot. (getContainerHint / countHasTextMatches
+// now go through hasTextValue instead, which is pure textContent for a
+// different reason -- matching Playwright's hasText exactly.)
 function getRenderedOrFullText(el: Element): string {
   const innerText = (el as HTMLElement).innerText;
   return innerText && innerText.trim() ? innerText : el.textContent || '';
@@ -336,8 +347,46 @@ function hasDuplicateTestId(el: Element): DuplicateCheck {
   return classifyMatches(el, matches);
 }
 
+// A form control's `name` attribute is the sturdiest hook it has: unlike visible
+// text it survives copy edits, and unlike a <select>'s "text" (its entire
+// concatenated option list) it stays small and stable. Only useful when the
+// tag+name pair is actually unique on the page — radio/checkbox groups
+// deliberately share one name across every option, so those come back ambiguous
+// and buildLeaf falls through to another strategy.
+function hasDuplicateName(el: Element): DuplicateCheck {
+  const name = (el as HTMLInputElement).name;
+  if (!name || !['input', 'select', 'textarea'].includes(el.tagName.toLowerCase())) {
+    return { ambiguous: false, hiddenDuplicate: false };
+  }
+  const tag = el.tagName.toLowerCase();
+  const matches = Array.from(document.querySelectorAll(`${tag}[name="${CSS.escape(name)}"]`));
+  return classifyMatches(el, matches);
+}
+
 function normalizeText(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
+}
+
+// The exact string Playwright's `.filter({ hasText })` / getByText will test at
+// run time. Playwright's `elementText` concatenates descendant text with NO
+// separator between block elements, strips zero-width chars, then collapses
+// whitespace (see playwright-core elementText + normalizeWhiteSpace). innerText
+// disagrees whenever adjacent block children have no whitespace text node
+// between them:
+//   <div>Warehouse</div><div>Ace Hardware</div>
+//   innerText   -> "Warehouse Ace Hardware"   (layout inserts a break)
+//   textContent -> "WarehouseAce Hardware"    (what hasText actually sees)
+// Validating a hasText candidate against innerText therefore accepts strings
+// ("Warehouse Ace") that match 0 elements at run time. Every uniqueness check
+// feeding buildContainerScope must use this instead. textContent also carries
+// text from display:none nodes, which Playwright's strict mode counts too, so
+// this is strictly better than the old innerText-first approach for predicting
+// hasText — no hidden-duplicate blind spot.
+function hasTextValue(el: Element): string {
+  // Playwright also strips U+200B / U+00AD before matching; skipped here since
+  // they turn up in card/row text vanishingly rarely and the only cost is the
+  // recorder picking a slightly longer hasText prefix.
+  return normalizeText(el.textContent || '');
 }
 
 // A common responsive pattern (e.g. separate desktop/mobile nav markup, one
@@ -364,15 +413,17 @@ function getMeaningfulClassName(el: Element): string | undefined {
   return undefined;
 }
 
-// How many elements matching `selector` currently have hasText-matching text
-// (Playwright's hasText is a substring check, so we mirror that here). This is
-// the same query buildContainerScope will emit, so checking it at record time
-// tells us whether that locator will actually be unique before we commit to it.
+// How many elements matching `selector` currently have hasText-matching text.
+// Playwright's hasText is a case-insensitive substring check against the
+// concatenated-textContent value (hasTextValue) — NOT innerText — so we mirror
+// exactly that here. This is the same query buildContainerScope will emit, so
+// checking it at record time tells us whether that locator will actually be
+// unique (and will match at all) before we commit to it.
 function countHasTextMatches(selector: string, text: string): number {
+  const needle = text.toLowerCase();
   let count = 0;
   document.querySelectorAll(selector).forEach((node) => {
-    const nodeText = normalizeText(getRenderedOrFullText(node));
-    if (nodeText.includes(text)) count++;
+    if (hasTextValue(node).toLowerCase().includes(needle)) count++;
   });
   return count;
 }
@@ -403,7 +454,12 @@ function getContainerHint(el: Element): ElementDescriptor['containerHint'] {
   let node: Element | null = el.parentElement;
   let depth = 0;
   while (node && node !== document.body && depth < 10) {
-    const text = normalizeText((node as HTMLElement).innerText || '').slice(0, 100);
+    // Seed from what Playwright's hasText will actually see (concatenated
+    // textContent, no block separators), so the word-prefixes shrinkToUniqueText
+    // slices are words that truly sit adjacent at match time. innerText here
+    // produced phantom prefixes like "Warehouse Ace" for
+    // <div>Warehouse</div><div>Ace Hardware</div> that matched 0 at run time.
+    const text = hasTextValue(node).slice(0, 100);
     if (text) {
       const className = getMeaningfulClassName(node);
       const selector = className ? `.${CSS.escape(className)}` : node.tagName.toLowerCase();
@@ -429,10 +485,26 @@ function buildElementDescriptor(el: Element): ElementDescriptor {
   const roleText = hasSameRoleAndText(el, role, text);
   const testId = hasDuplicateTestId(el);
   const id = hasDuplicateId(el);
+  const nameDup = hasDuplicateName(el);
+  const name = (el as HTMLInputElement).name || undefined;
+  const type = (el as HTMLInputElement).type || undefined;
+  const nameAmbiguous = nameDup.ambiguous;
   const roleTextAmbiguous = roleText.ambiguous;
   const testIdAmbiguous = testId.ambiguous;
+  // A form control we'll key off `name` for: its own visibility duplicate (a
+  // responsive form rendered twice, one breakpoint-hidden) still needs the
+  // .filter({ visible: true }) guard, exactly as for the testId/id strategies.
+  const nameChosen =
+    ['input', 'select', 'textarea'].includes(tag) &&
+    !['radio', 'checkbox'].includes(type ?? '') &&
+    Boolean(name) &&
+    !nameAmbiguous;
   const ambiguous = roleTextAmbiguous || testIdAmbiguous || id.ambiguous;
-  const hiddenDuplicate = roleText.hiddenDuplicate || testId.hiddenDuplicate || id.hiddenDuplicate;
+  const hiddenDuplicate =
+    roleText.hiddenDuplicate ||
+    testId.hiddenDuplicate ||
+    id.hiddenDuplicate ||
+    (nameChosen && nameDup.hiddenDuplicate);
   // Only worth computing when nothing else is going to save this element: a
   // testid or a clean role+name already beats any xpath, and containerHint
   // scoping only kicks in when ambiguous anyway. Anchored xpath exists for the
@@ -451,6 +523,9 @@ function buildElementDescriptor(el: Element): ElementDescriptor {
     ariaLabel,
     roleTextAmbiguous,
     tag,
+    name,
+    nameAmbiguous,
+    type,
     nearbyText,
     textTruncated,
     xpathIsAnchored: Boolean(anchoredXPath),
@@ -459,8 +534,9 @@ function buildElementDescriptor(el: Element): ElementDescriptor {
   return {
     tag,
     id: el.id || undefined,
-    name: (el as HTMLInputElement).name || undefined,
-    type: (el as HTMLInputElement).type || undefined,
+    name,
+    type,
+    nameAmbiguous,
     role,
     ariaLabel,
     text,

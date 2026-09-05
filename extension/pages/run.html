@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AI Test Recorder — Run</title>
+    <link rel="stylesheet" href="run.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title-row">
+        <h1>AI-Generated Test</h1>
+        <span id="phase-badge" class="badge">Connecting…</span>
+      </div>
+      <div id="test-title" class="test-title"></div>
+      <div class="toolbar">
+        <button id="copy-btn" disabled>Copy code</button>
+        <button id="reheal-btn" disabled>Re-heal</button>
+        <button id="cancel-btn" disabled>Cancel</button>
+        <button id="close-btn">Close</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="alert" class="alert hidden"></section>
+
+      <section id="summary-section" class="hidden">
+        <h2>Test case</h2>
+        <ul id="summary-steps"></ul>
+      </section>
+
+      <section id="diff-section" class="hidden">
+        <h2>What self-healing changed</h2>
+        <pre id="diff" class="code diff"></pre>
+      </section>
+
+      <section id="code-section" class="hidden">
+        <h2>Playwright code</h2>
+        <pre id="code" class="code"></pre>
+      </section>
+
+      <section id="diagnoses-section" class="hidden">
+        <h2>Diagnoses</h2>
+        <ol id="diagnoses"></ol>
+      </section>
+
+      <section id="log-section">
+        <h2>Progress</h2>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+
+    <script src="../dist/run.js"></script>
+  </body>
+</html>

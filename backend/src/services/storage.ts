@@ -32,8 +32,10 @@ export function saveGeneratedTest(id: string, testCase: GeneratedTestCase, playw
     testCase.title
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
-      .replace(/(^-|-$)/g, '') || id;
-  const specFile = path.join(TESTS_DIR, `${slug}.spec.ts`);
+      .replace(/(^-|-$)/g, '') || 'test';
+  // Suffix with the record id: two tests with the same title would otherwise
+  // silently overwrite each other's spec file (and each other's heal edits).
+  const specFile = path.join(TESTS_DIR, `${slug}--${id}.spec.ts`);
   writeFileSync(specFile, playwrightCode);
 
   const jsonFile = path.join(RECORDINGS_DIR, `${id}.result.json`);

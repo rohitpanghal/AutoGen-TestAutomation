@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AI Test Recorder — Review</title>
+    <link rel="stylesheet" href="review.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title-row">
+        <h1>Review recorded steps</h1>
+        <span id="count" class="badge">0 steps</span>
+      </div>
+      <p class="hint">
+        Fix values, delete stray clicks, reorder, and — most importantly — describe
+        the <em>intent</em> of a step. A description is handed to the model as the
+        source of truth for that step, so it can generate a real check
+        (e.g. <em>“assert every visible table row’s Name column contains the text
+        typed in the search box”</em>) instead of just replaying a click. Use
+        <strong>+ Add instruction step</strong> for a check that was never a
+        recorded event.
+      </p>
+      <label class="name-field">
+        <span>Test name</span>
+        <input id="test-name" type="text" placeholder="e.g. Cancel appointment" />
+      </label>
+    </header>
+
+    <main>
+      <div id="alert" class="alert" hidden></div>
+
+      <div class="list-toolbar">
+        <button id="add-note-end" type="button" class="secondary">+ Add instruction step</button>
+      </div>
+
+      <ol id="steps"></ol>
+      <p id="empty" class="empty" hidden>No steps left. Add an instruction step or re-record.</p>
+    </main>
+
+    <footer>
+      <button id="generate-btn" type="button">Generate test</button>
+      <button id="close-btn" type="button" class="secondary">Close</button>
+    </footer>
+
+    <script src="../dist/review.js"></script>
+  </body>
+</html>

@@ -37,9 +37,24 @@ function xpathLeaf(el: ElementDescriptor): string | undefined {
 // skipped in favor of whichever attribute the recorder actually found to be
 // unique for this element — falling through beats trusting priority order blindly.
 function buildLeaf(el: ElementDescriptor): { expr: string; needsScope: boolean } {
+  // Form controls key off the `name` attribute before anything text-derived. A
+  // <select>'s "text" is its whole concatenated option list, so getByRole(
+  // 'combobox', { name }) balloons into a brittle multi-line literal and
+  // getByText matches nothing — `select[name="produceType"]` is small, stable,
+  // and survives option/label churn. Radio & checkbox groups share one name
+  // across every option, so nameAmbiguous is set for them and we fall through.
+  if (
+    ['input', 'select', 'textarea'].includes(el.tag) &&
+    !['radio', 'checkbox'].includes(el.type ?? '') &&
+    el.name &&
+    !el.nameAmbiguous
+  ) {
+    return { expr: `locator(${quoted(`${el.tag}[name="${el.name}"]`)})`, needsScope: false };
+  }
   if (el.testId && !el.testIdAmbiguous) {
     return { expr: `getByTestId(${quoted(el.testId)})`, needsScope: false };
   }
+  
   if (el.role && (el.text || el.ariaLabel) && !el.roleTextAmbiguous) {
     const name = el.ariaLabel || el.text!;
     return { expr: `getByRole(${quoted(el.role)}, { name: ${quoted(name)} })`, needsScope: false };

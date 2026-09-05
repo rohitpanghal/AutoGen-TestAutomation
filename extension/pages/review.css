@@ -1,0 +1,261 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px;
+  color: #1f2328;
+  background: #f6f7f9;
+  padding-bottom: 72px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+header {
+  background: #fff;
+  border-bottom: 1px solid #e2e4e8;
+  padding: 16px 20px;
+}
+
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+h1 {
+  font-size: 16px;
+  margin: 0;
+}
+
+.hint {
+  color: #57606a;
+  max-width: 760px;
+  line-height: 1.5;
+  margin: 8px 0 12px;
+}
+
+.badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eaeef2;
+  color: #57606a;
+  white-space: nowrap;
+}
+
+.name-field {
+  display: block;
+  max-width: 420px;
+}
+
+.name-field span {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #57606a;
+  margin-bottom: 4px;
+}
+
+.name-field input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+main {
+  padding: 20px;
+  max-width: 800px;
+}
+
+.alert {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #ffebe9;
+  border: 1px solid #ffc1bc;
+  color: #cf222e;
+  margin-bottom: 14px;
+}
+
+.list-toolbar {
+  margin-bottom: 12px;
+}
+
+ol#steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: step;
+}
+
+.step {
+  position: relative;
+  background: #fff;
+  border: 1px solid #e2e4e8;
+  border-radius: 8px;
+  padding: 12px 14px 12px 40px;
+  margin-bottom: 10px;
+  counter-increment: step;
+}
+
+.step::before {
+  content: counter(step);
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #8c959f;
+}
+
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.badge-click { background: #ddf4ff; color: #0969da; }
+.badge-input { background: #dafbe1; color: #1a7f37; }
+.badge-select { background: #fff1e5; color: #bc4c00; }
+.badge-navigate { background: #eaeef2; color: #57606a; }
+.badge-mark_step { background: #fff8c5; color: #7a5c00; }
+.badge-note { background: #f3e8ff; color: #8250df; }
+
+.summary {
+  color: #1f2328;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.mini {
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  border-radius: 6px;
+  width: 26px;
+  height: 26px;
+  font-size: 13px;
+  line-height: 1;
+  color: #57606a;
+}
+
+.mini:hover:not(:disabled) {
+  background: #eef1f4;
+}
+
+.mini:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.field {
+  display: block;
+  margin-top: 10px;
+}
+
+.field span {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #57606a;
+  margin-bottom: 4px;
+}
+
+.field input,
+.field textarea {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.field textarea:focus,
+.field input:focus,
+.name-field input:focus {
+  outline: 2px solid #0969da;
+  outline-offset: -1px;
+  border-color: #0969da;
+}
+
+.link-add {
+  margin-top: 10px;
+  border: none;
+  background: none;
+  color: #0969da;
+  padding: 2px 0;
+  font-size: 12px;
+}
+
+.link-add:hover {
+  text-decoration: underline;
+}
+
+.empty {
+  color: #57606a;
+}
+
+.secondary {
+  padding: 8px 14px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #f6f8fa;
+  font-size: 13px;
+}
+
+.secondary:hover {
+  background: #eef1f4;
+}
+
+footer {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  gap: 10px;
+  padding: 12px 20px;
+  background: #fff;
+  border-top: 1px solid #e2e4e8;
+}
+
+#generate-btn {
+  padding: 9px 18px;
+  border: 1px solid #1a7f37;
+  border-radius: 6px;
+  background: #1f883d;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#generate-btn:hover:not(:disabled) {
+  background: #1a7f37;
+}
+
+#generate-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

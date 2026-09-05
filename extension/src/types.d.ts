@@ -48,6 +48,10 @@ interface ElementDescriptor {
   // instead of assuming the highest-priority one (data-testid) is always safe.
   testIdAmbiguous?: boolean;
   roleTextAmbiguous?: boolean;
+  // True when `tag[name="..."]` matches more than one element on the page (a
+  // radio/checkbox group, or a form rendered twice). buildLeaf only prefers the
+  // `name` attribute for a form control when this is false.
+  nameAmbiguous?: boolean;
   // At least one other DOM match exists for this element (by id/testId/role+text)
   // but every one of them is currently hidden -- e.g. a responsive desktop/mobile
   // nav pair. Playwright's strict mode still counts hidden matches, so codegen
@@ -60,13 +64,19 @@ interface ElementDescriptor {
 }
 
 interface RecordedAction {
-  action: 'click' | 'input' | 'select' | 'navigate' | 'mark_step';
+  // 'note' is a review-time insertion: a description-only step with no recorded
+  // DOM event, used to spell out an assertion/comparison the model should
+  // implement at that point in the flow.
+  action: 'click' | 'input' | 'select' | 'navigate' | 'mark_step' | 'note';
   timestamp: number;
   url: string;
   element?: ElementDescriptor;
   value?: string;
   masked?: boolean;
   label?: string;
+  // Free-text intent the user attached to this step on the review page. The
+  // model treats it as authoritative — see SYSTEM_PROMPT in backend/anthropic.ts.
+  description?: string;
 }
 
 type ExtensionMessage =

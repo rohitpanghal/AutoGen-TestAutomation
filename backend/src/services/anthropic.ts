@@ -4,27 +4,31 @@ import { readFileSync } from 'node:fs';
 import Anthropic from '@anthropic-ai/sdk';
 import type { RecordedAction, GeneratedTestCase } from '../types.js';
 import type { HealingSession } from './healingBrowser.js';
+import { debugBlock } from './logging.js';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // Single source of truth for the model id (was inline in four places).
 const MODEL = 'claude-sonnet-5';
 
-function logBlock(label: string, data: unknown) {
-  console.log(`----- ${label} -----`);
-  console.log(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
-  console.log(`----- end ${label} -----`);
-}
-
 const SYSTEM_PROMPT = `You are a QA engineer AI. You receive a raw list of browser actions recorded by a Chrome extension (clicks, inputs, selects, navigations, and manual "mark_step" markers the user inserted to indicate logical step boundaries). Your job:
 
-1. Group actions between mark_step markers (and the start/end of the list) into logical test steps. Use the marker's label if provided.
-2. Write a human-readable test case: title, preconditions, steps, and expected results. Be conservative about expected results — only assert things directly supported by the recorded actions (e.g. a navigation, a visible element clicked). Do not invent outcomes you cannot justify from the data.
+1. Group actions between mark_step markers (and the start/end of the list) into logical test steps. Use the marker's label if provided. An "action":"note" entry is NOT a boundary — keep it inside the current step.
+2. Write a human-readable test case: title, preconditions, steps, and expected results. Be conservative about expected results — only assert things directly supported by the recorded actions (e.g. a navigation, a visible element clicked) OR explicitly requested in a user "description" (see below). Do not invent outcomes you cannot justify from either source.
 3. Generate a single Playwright TypeScript test (using @playwright/test) that reproduces the steps.
 
-Selectors — each action's element includes a precomputed "suggestedLocator": a ready-to-use Playwright locator expression string (e.g. "page.getByRole('button', { name: 'Login' })" or, for an element that collided with a duplicate elsewhere on the page, something like "page.locator('li').filter({ hasText: 'Change Password Logout' }).locator('#dropdownMenuLink')"). This was computed deterministically from the DOM at recording time, already accounts for uniqueness (duplicate ids, ambiguous role+text matches get scoped through a container or landmark), and is more reliable than anything you can derive yourself from the raw element fields. Use it verbatim: copy the expression and append the appropriate action call (.click(), .fill(value), .selectOption(value), etc). Do not re-derive your own selector from element.css, element.id, element.role, etc. when suggestedLocator is present — treat those raw fields as debugging context only. A suggestedLocator may end with ".filter({ visible: true })" — this guards against a hidden DOM duplicate (e.g. a responsive desktop/mobile nav pair, only one ever on-screen); keep it, it is load-bearing, not a stylistic choice to simplify away. It may also be a "page.locator('xpath=//...')" expression — this only happens when the app gave the recorder nothing better to hook into (no testid, no stable class anywhere up the tree, ambiguous role+text), and the xpath itself is text-anchored (verified unique at record time), not a fragile index path; keep it as-is. Only fall back to deriving a selector yourself (getByTestId > getByRole > getByLabel > getByText > page.locator(css)) in the rare case suggestedLocator is missing — prefer any of those over writing your own xpath, since you cannot verify uniqueness the way the recorder did.
+User-authored intent — after recording, the user reviews the action list and may attach a "description" string to any action, and may insert standalone steps with "action":"note" (these have no recorded element, no suggestedLocator, and exist only to carry an instruction). A description is the user's explicit statement of what that step is meant to do or verify, written with product knowledge you do not have from the raw events. Treat it as authoritative:
+- It overrides your own inference about the step's purpose. Reflect its wording in the corresponding test-case step.
+- It frequently asks for an assertion or comparison that is NOT a literal recorded event — e.g. "check that every visible table row's SKU column contains the text just typed into the search box". Implement exactly that as real Playwright assertions (expect(...)), iterating with count()/nth()/for-loops or toHaveText([...]) as needed. Do not settle for replaying the nearby click — produce the verification the user asked for.
+- It can also pin down WHICH element a step acts on when the recorded event alone is ambiguous — "the 1st visible Proceed button", "within the 'Warehouse Ace' card", "the row whose Status is Active". When it does, the locator you emit for that step MUST satisfy it, and the description overrides the SHAPE of suggestedLocator (though not its verified leaf strategy): (a) any text the description puts in quotes must appear verbatim in the emitted locator — as the hasText / name / getByText argument — never paraphrased, never replaced with a similar-looking value seen elsewhere in the DOM; (b) an ordinal ("1st", "2nd", "last") becomes .first() / .nth(n) / .last(), applied after .filter({ visible: true }) when the description says "visible"; (c) "within X" / "in the X card/row/section" becomes .filter({ hasText: 'X' }) (or a scope through X) wrapping suggestedLocator's leaf. Reconcile: start from suggestedLocator's leaf, then apply the description's scoping and indexing on top. If suggestedLocator and the description clearly point at different target elements, the description wins.
+- For an "action":"note" step, implement the instruction in sequence at its position in the flow. Derive whatever locators it needs using the same priority order below, keyed off neighbouring actions' elements when helpful.
+- If a description contradicts the raw event (e.g. "this button should NOT navigate away"), follow the description and encode it as the assertion.
 
-Waiting — never use page.waitForTimeout or any arbitrary sleep. Playwright locators auto-wait for actionability, so a normal "await page.getByRole(...).click()" already waits for the element. The one case that needs an explicit wait is a click immediately followed by a "navigate" action in the recording (the click caused a full page navigation): after that click, add "await page.waitForURL(...)" (match the recorded URL, or a stable substring of it) before interacting with anything on the new page. For an async UI change with no recorded navigation (e.g. a modal opening, an SPA route change), do not add a manual wait — let the next locator's auto-wait handle it; use "await expect(locator).toBeVisible()" only where the test is specifically asserting that something appeared.
+Selectors — each action's element includes a precomputed "suggestedLocator": a ready-to-use Playwright locator expression string (e.g. "page.getByRole('button', { name: 'Login' })" or, for an element that collided with a duplicate elsewhere on the page, something like "page.locator('li').filter({ hasText: 'Change Password Logout' }).locator('#dropdownMenuLink')"). This was computed deterministically from the DOM at recording time, already accounts for uniqueness (duplicate ids, ambiguous role+text matches get scoped through a container or landmark), and is more reliable than anything you can derive yourself from the raw element fields. Use it verbatim: copy the expression and append the appropriate action call (.click(), .fill(value), .selectOption(value), etc). Do not re-derive your own selector from element.css, element.id, element.role, etc. when suggestedLocator is present — treat those raw fields as debugging context only. The one exception is when the step's "description" pins down which element to target (see "User-authored intent" above): keep suggestedLocator's verified leaf but reshape its scoping/indexing to match the description, and preserve verbatim any string the description quotes. A suggestedLocator may end with ".filter({ visible: true })" — this guards against a hidden DOM duplicate (e.g. a responsive desktop/mobile nav pair, only one ever on-screen); keep it, it is load-bearing, not a stylistic choice to simplify away. It may also be a "page.locator('xpath=//...')" expression — this only happens when the app gave the recorder nothing better to hook into (no testid, no stable class anywhere up the tree, ambiguous role+text), and the xpath itself is text-anchored (verified unique at record time), not a fragile index path; keep it as-is. Only fall back to deriving a selector yourself (getByTestId > getByRole > getByLabel > getByText > page.locator(css)) in the rare case suggestedLocator is missing — prefer any of those over writing your own xpath, since you cannot verify uniqueness the way the recorder did. One override to that order: for a form control (input / select / textarea, other than a radio or checkbox) that has a "name" attribute, prefer page.locator('select[name="…"]') / page.locator('input[name="…"]') over getByText or a getByRole('combobox', { name: … }) whose name would just be the field's concatenated option list — the name attribute is smaller and far more stable than that text.
+
+Waiting — never use page.waitForTimeout or any arbitrary sleep. Playwright locators auto-wait for actionability, so a normal "await page.getByRole(...).click()" already waits for the element. The one case that needs an explicit wait is an action immediately followed by a "navigate" action in the recording — that action caused a navigation (a full page load AND an SPA route change are both recorded as "navigate"). After THAT specific action, and only that one, add "await page.waitForURL('**' + pathname)" using the path of the navigate action's url (leading "**" then the pathname, e.g. "**/bookappointments"), before interacting with anything on the new page.
+Placement is strict: tie the wait to the action the "navigate" immediately follows — NOT to whichever click "looks like" the navigating one (a login / submit / "Proceed" button), and NOT just because that url appears somewhere else in the recording. Cross-check with the "url" field: every action carries the url of the page it happened on. If action N and action N+1 share the same "url" and no "navigate" sits between them, nothing navigated there — no wait. If their "url" values differ (even with no "navigate" action recorded between them, e.g. an older recording), treat action N as having navigated to N+1's url and add the waitForURL after N. For an async UI change that did NOT change the url and produced no "navigate" action (a modal opening, an inline panel swap), do not add a manual wait — let the next locator's auto-wait handle it; use "await expect(locator).toBeVisible()" only where the test is specifically asserting that something appeared.
+One targeted exception for form submits: when a single click submits a form that the immediately preceding steps filled (a Save / Submit / Create button right after a run of fill / selectOption calls), the app often re-renders that button on each field commit and can detach it mid-click. For THAT click only, emit: first "await page.locator('input[name=\"…\"]').blur()" on the last field the test filled (commit its onChange re-render before the click), then issue the click through a re-resolving retry — "await expect(async () => { await <buttonLocator>.click({ timeout: 5000 }); }).toPass({ timeout: 30000 });". Do not wrap ordinary mid-flow clicks this way; only the form-submitting one.
 
 Values — every "input"/"select" action's "value" field is the real, literal value that was recorded (recording no longer masks anything). Use it verbatim in the generated fill/selectOption call. Never invent, guess, or paraphrase a value that isn't present in the recorded actions.
 
@@ -67,38 +71,44 @@ const TOOL = {
 
 export async function generateTest(
   testName: string,
-  actions: RecordedAction[]
+  actions: RecordedAction[],
+  opts: { signal?: AbortSignal } = {}
 ): Promise<{ testCase: GeneratedTestCase; playwrightCode: string }> {
   const userContent = `Test name: ${testName}\n\nRecorded actions (JSON):\n${JSON.stringify(actions, null, 2)}`;
   console.log(`[anthropic] emit_test request — model=${MODEL}, ${actions.length} actions`);
-  logBlock('anthropic emit_test INPUT', userContent);
+  debugBlock('anthropic emit_test INPUT', userContent);
 
-  const message = await client.messages.create({
-    model: MODEL,
-    max_tokens: 4096,
-    system: SYSTEM_PROMPT,
-    tools: [TOOL as unknown as Anthropic.Tool],
-    tool_choice: { type: 'tool', name: 'emit_test' },
-    messages: [{ role: 'user', content: userContent }],
-  });
+  const message = await client.messages.create(
+    {
+      model: MODEL,
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      tools: [TOOL as unknown as Anthropic.Tool],
+      tool_choice: { type: 'tool', name: 'emit_test' },
+      messages: [{ role: 'user', content: userContent }],
+    },
+    { signal: opts.signal }
+  );
   console.log(`[anthropic] emit_test response — stop_reason=${message.stop_reason}, tokens in=${message.usage.input_tokens} out=${message.usage.output_tokens}`);
 
   const toolUse = message.content.find((block) => block.type === 'tool_use');
   if (!toolUse || toolUse.type !== 'tool_use') {
     console.error('[anthropic] emit_test: model did not return a tool_use block');
-    logBlock('anthropic emit_test RAW response content', message.content);
+    debugBlock('anthropic emit_test RAW response content', message.content);
     throw new Error('Model did not return structured output.');
   }
   const output = toolUse.input as { testCase: GeneratedTestCase; playwrightCode: string };
-  logBlock('anthropic emit_test OUTPUT', output);
+  debugBlock('anthropic emit_test OUTPUT', output);
   return output;
 }
 
 const FIX_GUIDANCE = `You are debugging a failing Playwright test that was auto-generated from a recorded user flow. You are given the original test case description, the current test code, and the Playwright failure output (error message, stack trace, strict-mode violation details, etc).
 
-Diagnose the failure and produce a corrected version of the full test file. Likely causes, in rough order: (1) a selector that resolves to more than one element (strict mode violation) — if one of the matches is hidden/not visible (e.g. a responsive desktop/mobile duplicate, a collapsed accordion, an inactive tab), fix it by appending .filter({ visible: true }) to that locator, not .first()/.last()/.nth() — index-based picks are a coin flip that breaks again the moment DOM order changes, while a visible-only filter states the actual intent ("the one the user can see") and stays correct regardless of order; if instead every match is genuinely visible, that's a real ambiguity — fix it with a more specific role/name, a data-testid, or by scoping through a stable ancestor with .filter({ hasText: ... }); (2) a click that resolved to an element that is present in the DOM but never becomes visible/stable — this is usually the same hidden-duplicate situation as (1), not a timing problem, so prefer the visible filter over adding a wait; (3) a missing wait after an action that triggers navigation — add page.waitForURL(...), never a fixed sleep; (4) the application's actual behavior no longer matches what was recorded — this is not a test bug.
+Diagnose the failure and produce a corrected version of the full test file. Likely causes, in rough order: (1) a selector that resolves to more than one element (strict mode violation) — if one of the matches is hidden/not visible (e.g. a responsive desktop/mobile duplicate, a collapsed accordion, an inactive tab), fix it by appending .filter({ visible: true }) to that locator, not .first()/.last()/.nth() — index-based picks are a coin flip that breaks again the moment DOM order changes, while a visible-only filter states the actual intent ("the one the user can see") and stays correct regardless of order; if instead every match is genuinely visible, that's a real ambiguity — fix it with a more specific role/name, a data-testid, or by scoping through a stable ancestor with .filter({ hasText: ... }); for an ambiguous form control (input / select / textarea, not a radio/checkbox), reach for page.locator('select[name="…"]') / page.locator('input[name="…"]') before any text-based locator — the name attribute is stabler than a <select>'s visible-text (its whole option list) and than a nearby label; (2) a click that resolved to an element that is present in the DOM but never becomes visible — this is usually the same hidden-duplicate situation as (1), not a timing problem, so prefer the visible filter over adding a wait; (3) a missing wait after an action that triggers navigation — add page.waitForURL(...), never a fixed sleep; (4) the application's actual behavior no longer matches what was recorded — this is not a test bug; (5) the target IS visible and the click starts, but the failure output says "element is not stable", "element was detached from the DOM, retrying", or the click times out inside its own retry loop — this is a re-render race, NOT a hidden duplicate and NOT an app regression: an onChange / async-validation handler on a field filled by an earlier step keeps rebuilding the subtree, so the resolved node is destroyed before the click lands. Fix it with both of: (a) commit the previously filled field so its re-render happens before this action, not during it — await page.locator('input[name="…"]').blur() (or a Tab press) on the last field the test filled; (b) wrap ONLY the flaky action in a re-resolving retry so a mid-click detach re-resolves the locator instead of failing: await expect(async () => { await <locator>.click({ timeout: 5000 }); }).toPass({ timeout: 30000 }); — and add await expect(<locator>).toBeEnabled() first if the button also toggles disabled while the form settles. If the app exposes a concrete settle signal (a specific validation response, a spinner leaving the DOM), await that too. Never use page.waitForTimeout. The locator itself is correct here — do not change it, and set verifiedLocator to "".
 
-Make the smallest change that fixes the root cause. Do not weaken or delete an assertion just to make the test pass. If the failure output shows the application genuinely did something different from what the recording expected (not a selector or timing problem), that is a real regression, not a broken test: set likelyRealBug to true, leave the code's logic and assertions unchanged, and explain what changed in the diagnosis. Never use page.waitForTimeout.`;
+Invariants — do not paraphrase your way out of a failure. Any string that appears quoted in the test-case step or in that step's user intent, and any hasText / name / getByText / getByRole-name literal already present in the current (broken) locator, is a value you must keep. Fixing a locator by swapping one of these literals for a different one you found on the page (e.g. changing filter({ hasText: 'Warehouse Ace' }) to filter({ hasText: 'Ace Hardware' })) is never correct — it silently retargets the test. If no locator that preserves every such literal resolves to exactly one element, the app itself changed (a card renamed or removed, a label reworded): set likelyRealBug to true, leave the code unchanged, and name the literal that no longer matches in the diagnosis.
+
+Make the smallest change that fixes the root cause. Do not weaken or delete an assertion just to make the test pass. Do not "fix" a locator by dropping scoping that was there for a reason (a container .filter({ hasText }) / .filter({ visible: true }) chain) just because a shorter bare locator happens to be unique on the page right now — repair the segment that actually broke and keep the chain. If the failure output shows the application genuinely did something different from what the recording expected (not a selector or timing problem), that is a real regression, not a broken test: set likelyRealBug to true, leave the code's logic and assertions unchanged, and explain what changed in the diagnosis. Never use page.waitForTimeout.`;
 
 const FIX_SYSTEM_PROMPT = `${FIX_GUIDANCE}
 
@@ -107,13 +117,15 @@ Respond ONLY by calling the emit_fix tool.`;
 const FIX_SYSTEM_PROMPT_BROWSER = `${FIX_GUIDANCE}
 
 You have a LIVE headed browser parked on the page exactly as it is right before the failing step. Verify against it — do not guess:
-- try_locator({ expr }): run a "page.*" Playwright locator expression against the live page. Returns how many elements match and, for each, its tag / visible text / visibility / bounding box. THIS IS YOUR MAIN TOOL.
+- try_locator({ expr }): read-only — evaluates a "page.*" locator against the live page (never clicks or fills; that's advance). Returns count (Playwright strict mode counts hidden matches too), visibleCount, and up to 5 matches in DOM order — each with tag / role / testId / id / ariaLabel / text / visible / inViewport / enabled, plus scopeHint (the nearest ancestor with a testId or a meaningful class, and its text). Use scopeHint to rebuild a SCOPED locator (ancestor.filter({ hasText }) then the leaf) rather than collapsing a broken chain to a bare getByText. truncated = matches not shown; invalidExpression = the expr itself is malformed, so count/matches mean nothing. THIS IS YOUR MAIN TOOL.
 - aria_snapshot({ scopeExpr? }): the accessibility tree of the whole page, or of the subtree matched by scopeExpr.
 - get_html({ expr, n? }): outerHTML of the first n matches (default 2) of a locator expression.
 - advance({ kind, expr, value? }): click / fill / select on the live page, to move one step further along if the failure only reproduces after more interaction.
 - screenshot({ label }): capture the current page.
 
-Workflow: first reproduce the problem — call try_locator on the CURRENT failing locator and confirm the match count. Then iterate candidate locators with try_locator until one matches EXACTLY ONE element, preferring the recorder's priority order: getByTestId > getByRole with name > getByLabel > getByText > a locator scoped through a stable ancestor with .filter({ hasText }) or .filter({ visible: true }). Only once you have seen count === 1 for your replacement, call emit_fix with that exact expression in verifiedLocator. If the failure is a genuine app regression, set likelyRealBug true, leave the code unchanged, and set verifiedLocator to "".`;
+Which step actually failed: the Playwright failure output is authoritative. The "replayed to recorded action #N" parking point is only a hint and is sometimes a false positive — most often a not-yet-hydrated SPA reporting 0 matches for the very first locator, which then resolves fine. If the parked locator probes as count === 1 and looks healthy, do not keep hunting it: pivot to the locator named in the Playwright call log / error output and fix that one.
+
+Workflow: first reproduce the problem — call try_locator on the locator from the Playwright failure output (falling back to the parked-step locator) and confirm the match count. If it reports count > 1 but visibleCount === 1, the fix is just to append .filter({ visible: true }) to that same locator — do not switch to a different or shorter one. If the failure output says "element is not stable" or "element was detached from the DOM, retrying" and try_locator shows that same locator at count === 1, visible and enabled, stop probing — the locator is fine, this is a re-render race (cause 5): leave the locator unchanged, set verifiedLocator to "", and in the code blur/commit the previously filled field and wrap only the failing action in await expect(async () => { await <locator>.click({ timeout: 5000 }); }).toPass({ timeout: 30000 }). If the failing locator matches 0 elements and no candidate that preserves every required literal can match exactly one, that is a real app regression — set likelyRealBug true, name the literal that no longer matches, and leave the code unchanged. Otherwise iterate candidate locators with try_locator until one matches EXACTLY ONE element, preferring the recorder's priority order: getByTestId > getByRole with name > getByLabel > getByText > a locator scoped through a stable ancestor with .filter({ hasText }) or .filter({ visible: true }). Exception for form controls (input / select / textarea, excluding radio/checkbox): try page.locator('select[name="…"]') / page.locator('input[name="…"]') right after getByTestId and before any role-name or text strategy — for a <select> especially, getByRole('combobox', { name: … }) drags in the entire option list as the name and is far more brittle than the name attribute. When the failing locator is a scoped chain (ancestor .filter(...) then a leaf), keep the scoping: fix the segment that actually broke, don't replace the whole chain with a bare leaf that only happens to be unique on this page right now — use each match's scopeHint to find the ancestor to scope through. Only once you have seen count === 1 for your replacement, call emit_fix with that exact expression in verifiedLocator. If the failure is a genuine app regression, set likelyRealBug true, leave the code unchanged, and set verifiedLocator to "".`;
 
 const FIX_TOOL = {
   name: 'emit_fix',
@@ -192,9 +204,26 @@ export interface FixContext {
   brokenAction?: RecordedAction;
   brokenLocatorExpr?: string;
   actionIndex: number;
+  // Human phrasing of *why* the replay parked ("locator matched 0 elements at
+  // replay time", "locator matched 3 elements", "action failed: …"). Replaces
+  // the old hard-coded "no longer resolves to exactly one visible element",
+  // which was frequently false — a not-yet-hydrated SPA parks at step 0.
+  breakSummary?: string;
 }
 
-const MAX_FIX_ITERATIONS = 12;
+// Pull the locator Playwright was actually stuck on out of a failure dump — the
+// "waiting for <locator>" line of a timeout call log, or the subject of a
+// strict-mode violation. This is ground truth for WHICH step broke; the replay
+// parking point is only a hint and can be a false positive.
+export function extractFailingLocator(output: string): string | undefined {
+  const strict = output.match(/strict mode violation:\s+(.+?)\s+resolved to \d+ element/);
+  if (strict) return strict[1].trim();
+  const waiting = output.match(/waiting for\s+(.+?)\s*(?:\n|$)/);
+  if (waiting) return waiting[1].trim();
+  return undefined;
+}
+
+const MAX_FIX_ITERATIONS = 8;
 
 // Public entry point. With a FixContext, runs the live-DOM verification agent;
 // without one, falls back to the original single text-only call (used by callers
@@ -203,41 +232,46 @@ export async function fixTest(
   testCase: GeneratedTestCase,
   code: string,
   failureOutput: string,
-  ctx?: FixContext
+  ctx?: FixContext,
+  signal?: AbortSignal
 ): Promise<FixResult> {
   return ctx
-    ? fixTestWithBrowser(testCase, code, failureOutput, ctx)
-    : fixTestTextOnly(testCase, code, failureOutput);
+    ? fixTestWithBrowser(testCase, code, failureOutput, ctx, signal)
+    : fixTestTextOnly(testCase, code, failureOutput, signal);
 }
 
 async function fixTestTextOnly(
   testCase: GeneratedTestCase,
   code: string,
-  failureOutput: string
+  failureOutput: string,
+  signal?: AbortSignal
 ): Promise<FixResult> {
   const userContent = `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}`;
   console.log(`[anthropic] emit_fix request — model=${MODEL}, failure output ${failureOutput.length} chars`);
-  logBlock('anthropic emit_fix INPUT', userContent);
+  debugBlock('anthropic emit_fix INPUT', userContent);
 
-  const message = await client.messages.create({
-    model: MODEL,
-    max_tokens: 4096,
-    system: FIX_SYSTEM_PROMPT,
-    tools: [FIX_TOOL as unknown as Anthropic.Tool],
-    tool_choice: { type: 'tool', name: 'emit_fix' },
-    messages: [{ role: 'user', content: userContent }],
-  });
+  const message = await client.messages.create(
+    {
+      model: MODEL,
+      max_tokens: 4096,
+      system: FIX_SYSTEM_PROMPT,
+      tools: [FIX_TOOL as unknown as Anthropic.Tool],
+      tool_choice: { type: 'tool', name: 'emit_fix' },
+      messages: [{ role: 'user', content: userContent }],
+    },
+    { signal }
+  );
   console.log(`[anthropic] emit_fix response — stop_reason=${message.stop_reason}, tokens in=${message.usage.input_tokens} out=${message.usage.output_tokens}`);
 
   const toolUse = message.content.find((block) => block.type === 'tool_use');
   if (!toolUse || toolUse.type !== 'tool_use') {
     console.error('[anthropic] emit_fix: model did not return a tool_use block');
-    logBlock('anthropic emit_fix RAW response content', message.content);
+    debugBlock('anthropic emit_fix RAW response content', message.content);
     throw new Error('Model did not return structured output.');
   }
   const fix = toolUse.input as FixResult;
   console.log(`[anthropic] diagnosis: ${fix.diagnosis} (likelyRealBug=${fix.likelyRealBug})`);
-  logBlock('anthropic emit_fix OUTPUT', fix);
+  debugBlock('anthropic emit_fix OUTPUT', fix);
   return fix;
 }
 
@@ -250,7 +284,13 @@ async function runBrowserTool(
     if (t.name === 'try_locator') {
       const { expr } = t.input as { expr: string };
       const probe = await session.probeLocator(expr);
-      trail.push(`try ${expr} -> ${probe.error ? `err(${probe.error})` : `count=${probe.count}`}`);
+      trail.push(
+        `try ${expr} -> ${
+          probe.error
+            ? `err(${probe.error})`
+            : `count=${probe.count}${probe.visibleCount !== probe.count ? ` (vis=${probe.visibleCount})` : ''}`
+        }`
+      );
       return { text: JSON.stringify(probe, null, 2) };
     }
     if (t.name === 'aria_snapshot') {
@@ -285,28 +325,47 @@ async function fixTestWithBrowser(
   testCase: GeneratedTestCase,
   code: string,
   failureOutput: string,
-  ctx: FixContext
+  ctx: FixContext,
+  signal?: AbortSignal
 ): Promise<FixResult> {
-  const { session, brokenAction, brokenLocatorExpr, actionIndex } = ctx;
+  const { session, brokenAction, brokenLocatorExpr, actionIndex, breakSummary } = ctx;
+  // The per-action user intent, if the reviewer attached one. It carries the
+  // literals ("Warehouse Ace", "1st visible", …) the fix must preserve, so pass
+  // it explicitly rather than making the agent hunt for the matching step in
+  // the testCase JSON.
+  const intentLine = brokenAction?.description
+    ? `\n\nUser intent for that step (authoritative — every quoted string in it is a value you may NOT change):\n${brokenAction.description}`
+    : '';
+  const failingFromOutput = extractFailingLocator(failureOutput);
+  // The parked step and the step Playwright actually failed on can differ (a
+  // false-positive park, or the failure is further along). When the failure
+  // output names a locator, say so explicitly and point the agent at it.
+  const authoritativeNote = failingFromOutput
+    ? `\n\nThe authoritative Playwright run failed while waiting on this locator — this is ground truth for WHICH step is broken. Trust it over the parking point above (which can be a false positive, e.g. a not-yet-hydrated SPA on the first step):\n${failingFromOutput}`
+    : '';
   const brokenContext = brokenLocatorExpr
-    ? `\n\nThe live browser was replayed to recorded action #${actionIndex} (${brokenAction?.action}). Its locator no longer resolves to exactly one visible element:\n${brokenLocatorExpr}\n\nRecorded element descriptor for that action:\n${JSON.stringify(brokenAction?.element ?? {}, null, 2)}`
-    : `\n\nEvery recorded locator still resolves; the failure is likely an assertion or timing issue at or after recorded action #${actionIndex}. The live browser is parked there.`;
+    ? `\n\nThe live browser was replayed to recorded action #${actionIndex} (${brokenAction?.action}). Parking reason: ${breakSummary ?? 'locator did not resolve to exactly one element'}.\nParked-step locator:\n${brokenLocatorExpr}${intentLine}${authoritativeNote}\n\nRecorded element descriptor for that action:\n${JSON.stringify(brokenAction?.element ?? {}, null, 2)}`
+    : `\n\nThe replay reached recorded action #${actionIndex} without a locator breaking; the failure is likely an assertion or timing issue at or after that point. The live browser is parked there.${intentLine}${authoritativeNote}`;
 
   const userContent = `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}${brokenContext}`;
   console.log(`[anthropic] emit_fix (browser agent) — model=${MODEL}, failure output ${failureOutput.length} chars`);
-  logBlock('anthropic emit_fix INPUT', userContent);
+  debugBlock('anthropic emit_fix INPUT', userContent);
 
   const messages: Anthropic.MessageParam[] = [{ role: 'user', content: userContent }];
   const trail: string[] = [];
 
   for (let iter = 1; iter <= MAX_FIX_ITERATIONS; iter++) {
-    const message = await client.messages.create({
-      model: MODEL,
-      max_tokens: 8192,
-      system: FIX_SYSTEM_PROMPT_BROWSER,
-      tools: BROWSER_TOOLS,
-      messages,
-    });
+    if (signal?.aborted) throw new Error('Cancelled');
+    const message = await client.messages.create(
+      {
+        model: MODEL,
+        max_tokens: 8192,
+        system: FIX_SYSTEM_PROMPT_BROWSER,
+        tools: BROWSER_TOOLS,
+        messages,
+      },
+      { signal }
+    );
     console.log(
       `[anthropic] fix iter ${iter}/${MAX_FIX_ITERATIONS} — stop_reason=${message.stop_reason}, tokens in=${message.usage.input_tokens} out=${message.usage.output_tokens}`
     );
@@ -328,10 +387,17 @@ async function fixTestWithBrowser(
       const candidate = emit.input as FixResult;
       let rejectReason = '';
       if (!candidate.likelyRealBug && candidate.verifiedLocator && candidate.verifiedLocator.trim()) {
-        const probe = await session.probeLocator(candidate.verifiedLocator.trim());
-        trail.push(`verify ${candidate.verifiedLocator.trim()} -> count=${probe.count}`);
+        const expr = candidate.verifiedLocator.trim();
+        const probe = await session.probeLocator(expr);
+        trail.push(
+          `verify ${expr} -> count=${probe.count}${probe.visibleCount !== probe.count ? ` (vis=${probe.visibleCount})` : ''}`
+        );
         if (probe.count !== 1) {
-          rejectReason = `verifiedLocator "${candidate.verifiedLocator.trim()}" matches ${probe.count} element(s), need exactly 1. Matches: ${JSON.stringify(probe.matches)}. Keep iterating with try_locator.`;
+          const hint =
+            probe.visibleCount === 1
+              ? ' Exactly one match is visible — append .filter({ visible: true }) to this locator instead of choosing a different one.'
+              : '';
+          rejectReason = `verifiedLocator "${expr}" matches ${probe.count} element(s), need exactly 1.${hint} Matches: ${JSON.stringify(probe.matches)}. Keep iterating with try_locator.`;
         }
       }
       if (!rejectReason) {
@@ -342,7 +408,7 @@ async function fixTestWithBrowser(
           verifiedLocator: candidate.verifiedLocator,
         };
         console.log(`[anthropic] diagnosis: ${result.diagnosis} (likelyRealBug=${result.likelyRealBug})`);
-        logBlock('anthropic emit_fix OUTPUT', result);
+        debugBlock('anthropic emit_fix OUTPUT', result);
         return result;
       }
       messages.push({

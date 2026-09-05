@@ -136,3 +136,27 @@ button:disabled {
   opacity: 0.6;
   cursor: default;
 }
+
+.link-btn {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  border: none;
+  background: none;
+  color: #1a73e8;
+  text-align: left;
+  padding: 4px 0;
+}
+
+.link-btn:hover {
+  background: none;
+  text-decoration: underline;
+}
+
+#sent p {
+  margin: 4px 0 10px;
+}
+
+#sent button:not(.link-btn) {
+  width: 100%;
+}
