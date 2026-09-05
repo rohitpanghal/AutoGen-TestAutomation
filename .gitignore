@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+
+backend/data/
+backend/generated-tests/*.spec.ts
+
+playwright-report/
+test-results/

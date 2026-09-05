@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AI Test Recorder</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <span id="status-dot" class="dot idle"></span>
+        <span id="status-text">Idle</span>
+      </header>
+
+      <div id="setup" class="panel">
+        <input id="test-name" type="text" placeholder="Test name (e.g. Cancel order)" />
+        <button id="start-btn">Start Recording</button>
+      </div>
+
+      <div id="recording" class="panel hidden">
+        <div id="action-count">0 actions recorded</div>
+        <ul id="action-list"></ul>
+        <div class="row">
+          <button id="mark-step-btn">Mark Step</button>
+          <button id="stop-btn">Stop &amp; Generate</button>
+        </div>
+      </div>
+
+      <div id="generating" class="panel hidden">
+        <p>Generating test with Claude…</p>
+      </div>
+
+      <div id="result" class="panel hidden">
+        <h3>AI-Generated Test</h3>
+        <div id="test-summary"></div>
+        <pre id="test-code"></pre>
+        <div class="row">
+          <button id="copy-btn">Copy Code</button>
+          <button id="heal-btn">Run &amp; Self-Heal</button>
+        </div>
+        <div id="heal-status"></div>
+        <div class="row">
+          <button id="new-btn">New Recording</button>
+        </div>
+      </div>
+
+      <div id="error" class="panel hidden error-panel"></div>
+    </div>
+    <script src="../dist/popup.js"></script>
+  </body>
+</html>

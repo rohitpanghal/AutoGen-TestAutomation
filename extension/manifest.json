@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "AI Test Recorder",
+  "version": "0.1.0",
+  "description": "Record browser actions and turn them into AI-generated Playwright tests.",
+  "permissions": ["storage", "activeTab", "scripting", "webNavigation"],
+  "host_permissions": ["http://localhost/*", "<all_urls>"],
+  "background": {
+    "service_worker": "dist/background.js"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "AI Test Recorder"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
