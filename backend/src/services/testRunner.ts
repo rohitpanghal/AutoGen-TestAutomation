@@ -8,7 +8,11 @@ import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 
 const MAX_OUTPUT_CHARS = 6000;
-const RUN_TIMEOUT_MS = 60_000;
+// Must stay comfortably above generated-tests/playwright.config.ts's own test
+// timeout (90_000ms) — otherwise this wrapper's exec timeout kills the process
+// before Playwright's internal timeout fires, so the failure never gets
+// reported and the self-heal loop diagnoses off an empty error.
+const RUN_TIMEOUT_MS = 120_000;
 
 export interface TestRunResult {
   passed: boolean;
@@ -23,6 +27,7 @@ export async function runPlaywrightTest(specFile: string): Promise<TestRunResult
   // matches reliably since testDir already scopes the search to this folder.
   const fileArg = path.basename(specFile);
   const command = `npx playwright test "${fileArg}" --config generated-tests/playwright.config.ts --reporter=line`;
+  console.log(`[runner] $ ${command}`);
   try {
     const { stdout, stderr } = await execAsync(command, {
       cwd: process.cwd(),
@@ -30,10 +35,15 @@ export async function runPlaywrightTest(specFile: string): Promise<TestRunResult
       env: process.env,
       maxBuffer: 10 * 1024 * 1024,
     });
-    return { passed: true, output: `${stdout}\n${stderr}`.trim().slice(-MAX_OUTPUT_CHARS) };
+    const output = `${stdout}\n${stderr}`.trim().slice(-MAX_OUTPUT_CHARS);
+    console.log(`[runner] passed`);
+    console.log(`----- runner OUTPUT -----\n${output}\n----- end runner OUTPUT -----`);
+    return { passed: true, output };
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string; message?: string };
-    const output = `${e.stdout ?? ''}\n${e.stderr ?? ''}`.trim() || e.message || 'Unknown Playwright failure';
-    return { passed: false, output: output.slice(-MAX_OUTPUT_CHARS) };
+    const output = (`${e.stdout ?? ''}\n${e.stderr ?? ''}`.trim() || e.message || 'Unknown Playwright failure').slice(-MAX_OUTPUT_CHARS);
+    console.log(`[runner] failed`);
+    console.log(`----- runner OUTPUT -----\n${output}\n----- end runner OUTPUT -----`);
+    return { passed: false, output };
   }
 }

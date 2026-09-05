@@ -16,7 +16,6 @@ const actionCountEl = el<HTMLDivElement>('action-count');
 const actionListEl = el<HTMLUListElement>('action-list');
 const testSummaryEl = el<HTMLDivElement>('test-summary');
 const testCodeEl = el<HTMLPreElement>('test-code');
-const healBtn = el<HTMLButtonElement>('heal-btn');
 const healStatusEl = el<HTMLDivElement>('heal-status');
 
 let lastGeneratedId: string | undefined;
@@ -28,12 +27,20 @@ interface HealHistoryEntry {
   diagnosis?: string;
 }
 
-interface HealResponse {
+interface HealingInfo {
   status: 'passed' | 'failed' | 'running';
   attempts: number;
   suspectedRealBug: boolean;
-  finalCode: string;
   history: HealHistoryEntry[];
+}
+
+interface GenerateResponse {
+  id: string;
+  testCase: { title: string; steps?: unknown[] };
+  playwrightCode: string;
+  specFile: string;
+  working: boolean;
+  healing: HealingInfo;
 }
 
 function showPanel(panel: HTMLElement) {
@@ -142,12 +149,30 @@ async function generateTest(state: RecorderState) {
     showError(`Backend error (${res.status}): ${await getErrorDetail(res)}`);
     return;
   }
-  const data = await res.json();
+  const data = (await res.json()) as GenerateResponse;
+  lastGeneratedId = typeof data.id === 'string' ? data.id : undefined;
+
+  // Self-healing already ran server-side before this response came back —
+  // if it never converged on passing code, don't show the user a broken
+  // test case at all; explain why instead.
+  if (!data.working) {
+    const last = data.healing?.history?.[data.healing.history.length - 1];
+    const reason = data.healing?.suspectedRealBug
+      ? 'The recorded flow looks like it hit a real app issue rather than a broken test — review the app manually.'
+      : `Self-healing could not produce a passing test after ${data.healing?.attempts ?? 0} attempt(s).`;
+    showError(last?.diagnosis ? `${reason} (${last.diagnosis})` : reason);
+    return;
+  }
+
   const stepCount = data.testCase?.steps?.length ?? 0;
   testSummaryEl.textContent = data.testCase?.title ? `${data.testCase.title} — ${stepCount} steps` : 'Generated';
   testCodeEl.textContent = data.playwrightCode || '';
-  lastGeneratedId = typeof data.id === 'string' ? data.id : undefined;
   healStatusEl.innerHTML = '';
+  const attempts = data.healing?.attempts ?? 0;
+  appendHealLine(
+    attempts > 0 ? `✓ Verified — passed after ${attempts} self-heal attempt${attempts === 1 ? '' : 's'}.` : '✓ Verified — passed on first try.',
+    'heal-pass'
+  );
   showPanel(resultPanel);
 }
 
@@ -157,55 +182,6 @@ function appendHealLine(text: string, className: string) {
   div.textContent = text;
   healStatusEl.appendChild(div);
 }
-
-function renderHealResult(data: HealResponse) {
-  if (data.finalCode) testCodeEl.textContent = data.finalCode;
-  healStatusEl.innerHTML = '';
-  data.history.forEach((h) => {
-    const label = `Attempt ${h.attempt + 1}: ${h.passed ? 'PASSED' : 'FAILED'}${h.diagnosis ? ` — ${h.diagnosis}` : ''}`;
-    appendHealLine(label, h.passed ? 'heal-pass' : 'heal-fail');
-  });
-  if (data.status === 'passed') {
-    appendHealLine('✓ Test is now passing.', 'heal-pass');
-  } else if (data.suspectedRealBug) {
-    appendHealLine('⚠ Stopped: this looks like a real application regression, not a broken test. Review manually.', 'heal-warning');
-  } else {
-    appendHealLine('✗ Still failing after max attempts. Review manually.', 'heal-fail');
-  }
-}
-
-healBtn.addEventListener('click', async () => {
-  if (!lastGeneratedId) {
-    showError('No generated test to heal yet — generate one first.');
-    return;
-  }
-  healBtn.disabled = true;
-  healStatusEl.innerHTML = '';
-  appendHealLine('Running test and self-healing… this can take a minute per attempt. Keep this popup open.', '');
-  let res: Response;
-  try {
-    res = await fetch(`${BACKEND_URL}/api/heal/${lastGeneratedId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ maxAttempts: 3 }),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    healStatusEl.innerHTML = '';
-    showError(`Could not reach backend at ${BACKEND_URL}. Is it running? (${message})`);
-    healBtn.disabled = false;
-    return;
-  }
-  if (!res.ok) {
-    healStatusEl.innerHTML = '';
-    showError(`Backend error (${res.status}): ${await getErrorDetail(res)}`);
-    healBtn.disabled = false;
-    return;
-  }
-  const data = (await res.json()) as HealResponse;
-  renderHealResult(data);
-  healBtn.disabled = false;
-});
 
 (async () => {
   const state = await sendMessage<RecorderState>({ type: 'GET_STATE' });

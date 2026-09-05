@@ -19,12 +19,23 @@ function quoted(s: string): string {
   return `'${escapeStr(sanitizeText(s))}'`;
 }
 
+// An xpath computed by content.ts is only emitted as `locator('xpath=...')`
+// when it's text/attribute-anchored (xpathIsAnchored) — a positional xpath is
+// exactly as fragile as the CSS nth-of-type fallback, so there'd be no point
+// preferring it. The anchored form is for apps that give us nothing else to
+// hook into: no testid, no stable class anywhere up the tree, no unambiguous
+// role+name/text.
+function xpathLeaf(el: ElementDescriptor): string | undefined {
+  if (!el.xpathIsAnchored || !el.xpath) return undefined;
+  return `locator(${quoted(`xpath=${el.xpath}`)})`;
+}
+
 // Returns the leaf expression plus whether it's still potentially non-unique on
 // its own (needs a landmark/containerHint wrapper). Priority order is
-// testId > role+name > label > text > css, but a duplicated "unique" attribute
-// (e.g. a shared component's hardcoded data-testid) is skipped in favor of
-// whichever attribute the recorder actually found to be unique for this element
-// — falling through beats trusting priority order blindly.
+// testId > role+name > label > text > anchored xpath > css, but a duplicated
+// "unique" attribute (e.g. a shared component's hardcoded data-testid) is
+// skipped in favor of whichever attribute the recorder actually found to be
+// unique for this element — falling through beats trusting priority order blindly.
 function buildLeaf(el: ElementDescriptor): { expr: string; needsScope: boolean } {
   if (el.testId && !el.testIdAmbiguous) {
     return { expr: `getByTestId(${quoted(el.testId)})`, needsScope: false };
@@ -37,12 +48,18 @@ function buildLeaf(el: ElementDescriptor): { expr: string; needsScope: boolean }
     return { expr: `getByLabel(${quoted(el.nearbyText)})`, needsScope: false };
   }
   if (el.text) {
-    return { expr: `getByText(${quoted(el.text)}, { exact: true })`, needsScope: Boolean(el.roleTextAmbiguous) };
+    // A truncated capture can never equal the element's real, full text, so an
+    // exact match against it is guaranteed to find nothing -- fall back to a
+    // substring match instead.
+    const exact = !el.textTruncated;
+    return { expr: `getByText(${quoted(el.text)}, { exact: ${exact} })`, needsScope: Boolean(el.roleTextAmbiguous) || Boolean(el.textTruncated) };
   }
   // Nothing unique to key off — fall back to whatever we have, but it needs scoping.
   if (el.testId) {
     return { expr: `getByTestId(${quoted(el.testId)})`, needsScope: true };
   }
+  const xpath = xpathLeaf(el);
+  if (xpath) return { expr: xpath, needsScope: false };
   return { expr: `locator(${quoted(el.css)})`, needsScope: true };
 }
 
@@ -56,8 +73,18 @@ function buildLandmarkScope(landmark: LandmarkDescriptor): string {
   return `locator(${quoted(landmark.tag)})`;
 }
 
+// className (a component-specific CSS class captured on the container, e.g.
+// ".warehouseCardText-ss") is preferred over role/tag when present: for
+// div/span-based card grids, `locator(tag)` matches every nesting level of the
+// card (outer wrapper, inner text block, ...), and hasText substring-matches
+// all of them since text propagates up through ancestors — a class scoped to
+// just the card component avoids that collision.
 function buildContainerScope(hint: ContainerHint): string {
-  const base = hint.role ? `getByRole(${quoted(hint.role)})` : `locator(${quoted(hint.tag)})`;
+  const base = hint.className
+    ? `locator(${quoted(`.${hint.className}`)})`
+    : hint.role
+      ? `getByRole(${quoted(hint.role)})`
+      : `locator(${quoted(hint.tag)})`;
   return `${base}.filter({ hasText: ${quoted(hint.text)} })`;
 }
 
@@ -67,11 +94,28 @@ function buildContainerScope(hint: ContainerHint): string {
 // duplicated testId in favor of it), wrapping it further would just add noise.
 export function buildLocatorExpression(el: ElementDescriptor): string {
   const { expr, needsScope } = buildLeaf(el);
+  let base = `page.${expr}`;
   if (needsScope) {
-    if (el.containerHint) return `page.${buildContainerScope(el.containerHint)}.${expr}`;
-    if (el.landmark) return `page.${buildLandmarkScope(el.landmark)}.${expr}`;
+    // A landmark testId is a stable, purpose-built hook — always more specific
+    // than a containerHint's class+hasText guess, so it wins when available.
+    if (el.landmark?.testId) base = `page.${buildLandmarkScope(el.landmark)}.${expr}`;
+    else if (el.containerHint) base = `page.${buildContainerScope(el.containerHint)}.${expr}`;
+    else if (el.landmark) base = `page.${buildLandmarkScope(el.landmark)}.${expr}`;
+    else {
+      // No CSS class or landmark anywhere up the tree to scope through — the
+      // gap an automation-unfriendly app forces us into. Anchored xpath can
+      // still resolve it via the ancestor axis, which plain CSS has no way to
+      // express without a class to hook into.
+      const xpath = xpathLeaf(el);
+      if (xpath) base = `page.${xpath}`;
+    }
   }
-  return `page.${expr}`;
+  // hiddenDuplicate means a hasText/role/testid scope narrows *which* copy of
+  // the component this is, but doesn't rule out that copy itself having a
+  // sibling that's identical except for CSS visibility (a responsive
+  // desktop/mobile pair, most commonly). Guarding on visibility is a no-op
+  // when there's truly only one match, so it's safe to always apply here.
+  return el.hiddenDuplicate ? `${base}.filter({ visible: true })` : base;
 }
 
 export function enrichActions(actions: RecordedAction[]): RecordedAction[] {
