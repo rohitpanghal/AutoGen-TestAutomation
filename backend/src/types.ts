@@ -13,6 +13,18 @@ export interface ContainerHint {
   className?: string;
 }
 
+// One viable way to point at an element, with its real match count on the
+// page it was captured from. Computed once at record/pick time
+// (extension/src/content.ts::buildLocatorCandidates) — purely for the review
+// page's benefit, never sent to the LLM (anthropic.ts strips this before
+// prompting: suggestedLocator already reflects whatever was chosen).
+export interface LocatorCandidate {
+  kind: 'testId' | 'name' | 'role' | 'text' | 'css' | 'xpath';
+  expr: string;
+  count: number;
+  isDefault?: boolean;
+}
+
 export interface ElementDescriptor {
   tag: string;
   id?: string;
@@ -51,22 +63,48 @@ export interface ElementDescriptor {
   hiddenDuplicate?: boolean;
   containerHint?: ContainerHint;
   suggestedLocator?: string;
+  // Present whenever this element was captured inside an iframe. selectorChain
+  // is empty and crossOrigin is true when the recorder couldn't reach
+  // window.frameElement from inside the frame (cross-origin) — no reliable
+  // selector for the frame itself exists in that case; frameUrl is a
+  // best-effort hint for the LLM to build one manually. See locatorBuilder.ts
+  // (frame-aware buildLocatorExpression) and SYSTEM_PROMPT in anthropic.ts.
+  frame?: {
+    selectorChain: string[];
+    crossOrigin: boolean;
+    frameUrl: string;
+  };
+  locatorCandidates?: LocatorCandidate[];
+  // QA's explicit choice (from the review page's candidate list, or typed
+  // directly) — wins verbatim over everything else when present. See
+  // buildLocatorExpression in services/locatorBuilder.ts.
+  locatorOverride?: string;
 }
 
 export interface RecordedAction {
   // 'note' is a review-time insertion: a description-only step with no recorded
   // DOM event, used to spell out an assertion/comparison the model should
   // implement at that point in the flow.
-  action: 'click' | 'input' | 'select' | 'navigate' | 'mark_step' | 'note';
+  // 'upload' is a change event on an <input type="file">. 'keydown' is a
+  // semantically meaningful key press (Enter / Escape / Tab) captured
+  // separately from 'input'/'select' since it has no element value to commit.
+  action: 'click' | 'input' | 'select' | 'navigate' | 'mark_step' | 'note' | 'upload' | 'keydown';
   timestamp: number;
   url: string;
   element?: ElementDescriptor;
+  // For 'input'/'select': the field value. For 'upload': the recorded
+  // filename (display-only, never usable as a real path). For 'keydown': the
+  // key combo in Playwright .press() format, e.g. "Enter", "Shift+Tab".
   value?: string;
   masked?: boolean;
   label?: string;
   // Free-text intent the user attached to this step on the extension's review
   // page. The model treats it as authoritative — see SYSTEM_PROMPT below.
   description?: string;
+  // 'upload' only: the real file path to pass to setInputFiles(...). A content
+  // script cannot read this itself (browsers redact it from a file input's
+  // .value), so it's supplied by the human on the review screen.
+  filePath?: string;
 }
 
 export interface TestStep {

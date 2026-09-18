@@ -15,6 +15,7 @@
       <div class="toolbar">
         <button id="copy-btn" disabled>Copy code</button>
         <button id="reheal-btn" disabled>Re-heal</button>
+        <button id="variant-btn" class="hidden">Create a variant from this flow</button>
         <button id="cancel-btn" disabled>Cancel</button>
         <button id="close-btn">Close</button>
       </div>
@@ -22,6 +23,26 @@
 
     <main>
       <section id="alert" class="alert hidden"></section>
+
+      <section id="approval-section" class="hidden">
+        <h2>Review before running</h2>
+        <p class="hint">
+          Nothing has run yet. Edit anything below if needed, then approve to start the
+          self-heal loop — or just close this tab to discard it, nothing has been committed.
+        </p>
+        <label class="field">
+          <span>Title</span>
+          <input id="approve-title" type="text" />
+        </label>
+        <ol id="approve-steps" class="approve-steps"></ol>
+        <label class="field">
+          <span>Playwright code</span>
+          <textarea id="approve-code" class="code-input" spellcheck="false"></textarea>
+        </label>
+        <div class="toolbar">
+          <button id="approve-btn">Approve &amp; run</button>
+        </div>
+      </section>
 
       <section id="summary-section" class="hidden">
         <h2>Test case</h2>

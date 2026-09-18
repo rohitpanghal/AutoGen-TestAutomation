@@ -29,9 +29,75 @@ const alertBox = byId<HTMLDivElement>('alert');
 // into it; structural changes (move / delete / insert) mutate it and re-render.
 let actions: RecordedAction[] = [];
 let testName = '';
+// Set when this page was opened as "Create a variant from this flow"
+// (?fromRecording=<id> — see run.ts) — sent back to /api/generate as pure
+// traceability, not used for anything else here.
+let parentId: string | undefined;
 
-function showAlert(msg: string) {
+// A step QA is in the middle of inserting: type + (for input/select) a value,
+// chosen before picking the target element on the live page. Not part of
+// `actions` until the pick resolves — render() draws it as an extra row right
+// after `afterIndex`.
+let pendingInsert: { afterIndex: number; type: 'click' | 'input' | 'select'; value: string } | null = null;
+
+// Element picker plumbing — background.ts opens/focuses a live tab and tells
+// its content script to enter pick mode; the picked element comes back via
+// chrome.storage.local's `pendingPick` key (content.ts can't message this
+// page directly, it isn't a tab). requestId lets more than one pick be
+// registered without a stale result resolving the wrong handler.
+const pickHandlers = new Map<string, (element: ElementDescriptor, url: string) => void>();
+
+// Which pick (if any) the "Picking…" alert's Cancel button applies to. Only
+// one pick is ever in flight from this page in practice, but tracked by id
+// rather than assumed so a resolved/cancelled pick can't stomp a newer one.
+let activePickRequestId: string | undefined;
+
+function startPick(url: string | undefined, onPicked: (element: ElementDescriptor, url: string) => void) {
+  const requestId = crypto.randomUUID();
+  pickHandlers.set(requestId, onPicked);
+  chrome.runtime.sendMessage({ type: 'START_PICK', requestId, url });
+  showPickingAlert(requestId);
+}
+
+// A pick session can now last a while (QA may browse around before arming —
+// see content.ts), so unlike the plain showAlert() this needs a way back out
+// without switching tabs: Cancel here does the same thing as the in-page
+// banner's own Cancel button.
+function showPickingAlert(requestId: string) {
+  activePickRequestId = requestId;
+  alertBox.innerHTML = '';
+  alertBox.className = 'alert info';
+  alertBox.appendChild(
+    document.createTextNode(
+      'Picking… switch to the opened tab, browse to where the element is, click "Target next click", then click it (Esc there to cancel). '
+    )
+  );
+  alertBox.appendChild(
+    miniBtn('Cancel', 'Cancel this pick', () => {
+      pickHandlers.delete(requestId);
+      chrome.runtime.sendMessage({ type: 'CANCEL_PICK', requestId });
+      if (activePickRequestId === requestId) activePickRequestId = undefined;
+      clearAlert();
+    })
+  );
+  alertBox.hidden = false;
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.pendingPick?.newValue) return;
+  const pick = changes.pendingPick.newValue as { requestId: string; element: ElementDescriptor; url: string };
+  const handler = pickHandlers.get(pick.requestId);
+  if (!handler) return;
+  pickHandlers.delete(pick.requestId);
+  chrome.storage.local.remove('pendingPick');
+  if (activePickRequestId === pick.requestId) activePickRequestId = undefined;
+  clearAlert();
+  handler(pick.element, pick.url);
+});
+
+function showAlert(msg: string, variant?: 'info') {
   alertBox.textContent = msg;
+  alertBox.className = variant ? `alert ${variant}` : 'alert';
   alertBox.hidden = false;
 }
 
@@ -56,9 +122,19 @@ function summarize(a: RecordedAction): string {
   }
 }
 
-function newNote(): RecordedAction {
-  return { action: 'note', timestamp: Date.now(), url: '', description: '' };
+function newNote(description = ''): RecordedAction {
+  return { action: 'note', timestamp: Date.now(), url: '', description };
 }
+
+// Quick-insert starting point for the "does the search actually filter?"
+// assertion — the single most common thing this kind of check needs.
+// Deliberately says "the text just typed" rather than a hardcoded term: the
+// backend prompt (anthropic.ts SYSTEM_PROMPT, point 22) already treats that
+// phrasing as a pointer back to the real recorded input value, not a literal
+// string to search for. Fully editable before generating, same as any other
+// note.
+const SEARCH_RESULTS_TEMPLATE =
+  "If any results are visible, assert that every visible result row contains the text just typed into the search box. If there are zero visible results, assert that a \"no results\" message is shown instead.";
 
 function miniBtn(label: string, title: string, onClick: () => void): HTMLButtonElement {
   const b = document.createElement('button');
@@ -99,14 +175,112 @@ function remove(i: number) {
   render();
 }
 
-function insertNoteAfter(i: number) {
-  actions.splice(i + 1, 0, newNote());
+function insertNoteAfter(i: number, description = '') {
+  actions.splice(i + 1, 0, newNote(description));
   render();
   focusDesc(i + 1);
 }
 
 function focusDesc(i: number) {
   listEl.querySelectorAll<HTMLTextAreaElement>('.desc-input')[i]?.focus();
+}
+
+// The locator that would actually be used right now: QA's override if set,
+// else whichever candidate content.ts marked isDefault (its best guess at
+// what buildLeaf would auto-pick server-side — see
+// backend/src/services/locatorBuilder.ts).
+function effectiveLocator(el: ElementDescriptor): string {
+  const override = el.locatorOverride?.trim();
+  if (override) return override;
+  return el.locatorCandidates?.find((c) => c.isDefault)?.expr ?? '(no locator captured)';
+}
+
+// Locator visibility + override, per step. Deliberately avoids calling the
+// page-level render() on every keystroke in the custom-locator input (that
+// would tear down and rebuild the whole list, dropping focus and collapsing
+// every <details>) — instead it patches just the "current locator" chip
+// directly, the same non-destructive pattern the description textarea and
+// Value field already use for their own onInput handlers.
+function buildLocatorSection(i: number): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'locator-section';
+
+  const current = document.createElement('div');
+  current.className = 'locator-current';
+  current.appendChild(document.createTextNode('Locator: '));
+  const codeEl = document.createElement('code');
+  current.appendChild(codeEl);
+  const overrideTag = document.createElement('span');
+  overrideTag.className = 'locator-override-tag';
+  overrideTag.textContent = 'QA override';
+  current.appendChild(overrideTag);
+  wrap.appendChild(current);
+
+  const refreshCurrent = () => {
+    const el = actions[i].element!;
+    codeEl.textContent = effectiveLocator(el);
+    overrideTag.hidden = !el.locatorOverride?.trim();
+  };
+  refreshCurrent();
+
+  const details = document.createElement('details');
+  details.className = 'locator-details';
+  const summaryEl = document.createElement('summary');
+  summaryEl.textContent = 'Locator options';
+  details.appendChild(summaryEl);
+
+  const candidates = actions[i].element!.locatorCandidates ?? [];
+  if (candidates.length > 0) {
+    const list = document.createElement('ul');
+    list.className = 'locator-candidates';
+    candidates.forEach((c) => {
+      const row = document.createElement('li');
+      const kind = document.createElement('span');
+      kind.className = 'locator-kind';
+      kind.textContent = c.kind;
+      const exprEl = document.createElement('code');
+      exprEl.textContent = c.expr;
+      const count = document.createElement('span');
+      count.className = c.count === 1 ? 'locator-count' : 'locator-count ambiguous';
+      count.textContent = `${c.count} match${c.count === 1 ? '' : 'es'}`;
+      const useBtn = miniBtn('Use', `Use this ${c.kind} locator`, () => {
+        actions[i].element = { ...actions[i].element!, locatorOverride: c.expr };
+        customInput.value = c.expr;
+        refreshCurrent();
+      });
+      useBtn.classList.add('locator-use');
+      row.append(kind, exprEl, count, useBtn);
+      list.appendChild(row);
+    });
+    details.appendChild(list);
+  } else {
+    const none = document.createElement('p');
+    none.className = 'hint';
+    none.textContent = 'No automatic candidates for this element — type one below.';
+    details.appendChild(none);
+  }
+
+  const customInput = textControl(actions[i].element!.locatorOverride ?? '', (v) => {
+    actions[i].element = { ...actions[i].element!, locatorOverride: v || undefined };
+    refreshCurrent();
+  });
+  customInput.placeholder = 'Full Playwright expression, e.g. page.getByRole(\'button\', { name: \'Submit\' }) — used verbatim';
+  details.appendChild(field('Custom locator (advanced)', customInput));
+
+  const resetBtn = document.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.className = 'link-add';
+  resetBtn.textContent = 'Reset to automatic';
+  resetBtn.addEventListener('click', () => {
+    const { locatorOverride, ...rest } = actions[i].element!;
+    actions[i].element = rest;
+    customInput.value = '';
+    refreshCurrent();
+  });
+  details.appendChild(resetBtn);
+
+  wrap.appendChild(details);
+  return wrap;
 }
 
 function buildRow(a: RecordedAction, i: number): HTMLLIElement {
@@ -134,7 +308,20 @@ function buildRow(a: RecordedAction, i: number): HTMLLIElement {
   up.disabled = i === 0;
   down.disabled = i === actions.length - 1;
 
-  head.append(badge, summary, spacer, up, down, del);
+  head.append(badge, summary, spacer);
+  // Retarget: point this step at a different live element instead of hand-
+  // editing a selector string. Only meaningful for a step that recorded one.
+  if (a.element) {
+    head.appendChild(
+      miniBtn('🎯', 'Retarget: pick a different element on the live page', () => {
+        startPick(a.url || undefined, (element) => {
+          actions[i] = { ...actions[i], element };
+          render();
+        });
+      })
+    );
+  }
+  head.append(up, down, del);
   li.appendChild(head);
 
   if (a.action === 'input' || a.action === 'select') {
@@ -146,6 +333,25 @@ function buildRow(a: RecordedAction, i: number): HTMLLIElement {
     li.appendChild(
       field('Label', textControl(a.label ?? '', (v) => { actions[i].label = v; }))
     );
+  }
+  if (a.action === 'upload') {
+    const path = field(
+      'File path (for setInputFiles) — leave blank to emit a TODO instead of a guess',
+      textControl(a.filePath ?? '', (v) => { actions[i].filePath = v; })
+    );
+    li.appendChild(path);
+  }
+  // A cross-origin iframe has no reliable selector for the frame itself from
+  // the inside — the generated locator will be a best-effort guess, so flag
+  // it here rather than let it look as trustworthy as every other step.
+  if (a.element?.frame?.crossOrigin) {
+    const hint = document.createElement('p');
+    hint.className = 'hint-warning';
+    hint.textContent = '⚠ Recorded inside a cross-origin iframe — the generated locator will be unverified; double check it after generating.';
+    li.appendChild(hint);
+  }
+  if (a.element) {
+    li.appendChild(buildLocatorSection(i));
   }
 
   const ta = document.createElement('textarea');
@@ -159,19 +365,96 @@ function buildRow(a: RecordedAction, i: number): HTMLLIElement {
   ta.addEventListener('input', () => { actions[i].description = ta.value; });
   li.appendChild(field(a.action === 'note' ? 'Instruction' : 'Intent / what to verify (optional)', ta));
 
+  const linkRow = document.createElement('div');
+  linkRow.className = 'link-row';
   const addNote = document.createElement('button');
   addNote.type = 'button';
   addNote.className = 'link-add';
   addNote.textContent = '+ Add instruction step below';
   addNote.addEventListener('click', () => insertNoteAfter(i));
-  li.appendChild(addNote);
+  const addAction = document.createElement('button');
+  addAction.type = 'button';
+  addAction.className = 'link-add';
+  addAction.textContent = '+ Add action step below';
+  addAction.addEventListener('click', () => {
+    pendingInsert = { afterIndex: i, type: 'click', value: '' };
+    render();
+  });
+  const addSearchAssert = document.createElement('button');
+  addSearchAssert.type = 'button';
+  addSearchAssert.className = 'link-add';
+  addSearchAssert.textContent = '+ Assert search results';
+  addSearchAssert.title = 'Insert a starting-point check for "did the search actually filter?" — edit the wording before generating';
+  addSearchAssert.addEventListener('click', () => insertNoteAfter(i, SEARCH_RESULTS_TEMPLATE));
+  linkRow.append(addNote, addAction, addSearchAssert);
+  li.appendChild(linkRow);
+
+  return li;
+}
+
+// The in-progress "add a real action step" form: pick a type (+ value for
+// input/select), then pick the target element on the live page. Not part of
+// `actions` until the pick resolves.
+function buildPendingInsertRow(): HTMLLIElement {
+  const pending = pendingInsert!;
+  const li = document.createElement('li');
+  li.className = 'step pending-insert';
+
+  const typeSelect = document.createElement('select');
+  (['click', 'input', 'select'] as const).forEach((t) => {
+    const opt = document.createElement('option');
+    opt.value = t;
+    opt.textContent = t;
+    if (t === pending.type) opt.selected = true;
+    typeSelect.appendChild(opt);
+  });
+  typeSelect.addEventListener('change', () => { pending.type = typeSelect.value as typeof pending.type; render(); });
+  li.appendChild(field('New step type', typeSelect));
+
+  if (pending.type !== 'click') {
+    li.appendChild(field('Value', textControl(pending.value, (v) => { pending.value = v; })));
+  }
+
+  const pickBtn = document.createElement('button');
+  pickBtn.type = 'button';
+  pickBtn.className = 'secondary';
+  pickBtn.textContent = 'Pick element on page';
+  pickBtn.addEventListener('click', () => {
+    const afterAction = actions[pending.afterIndex];
+    startPick(afterAction?.url || undefined, (element, url) => {
+      const newAction: RecordedAction = {
+        action: pending.type,
+        timestamp: Date.now(),
+        url,
+        element,
+        ...(pending.type !== 'click' ? { value: pending.value } : {}),
+      };
+      actions.splice(pending.afterIndex + 1, 0, newAction);
+      pendingInsert = null;
+      render();
+    });
+  });
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'link-add';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', () => { pendingInsert = null; render(); });
+
+  const row = document.createElement('div');
+  row.className = 'step-head';
+  row.append(pickBtn, cancelBtn);
+  li.appendChild(row);
 
   return li;
 }
 
 function render() {
   listEl.innerHTML = '';
-  actions.forEach((a, i) => listEl.appendChild(buildRow(a, i)));
+  actions.forEach((a, i) => {
+    listEl.appendChild(buildRow(a, i));
+    if (pendingInsert && pendingInsert.afterIndex === i) listEl.appendChild(buildPendingInsertRow());
+  });
   emptyEl.hidden = actions.length > 0;
   countEl.textContent = `${actions.length} step${actions.length === 1 ? '' : 's'}`;
   generateBtn.disabled = actions.length === 0;
@@ -220,7 +503,7 @@ generateBtn.addEventListener('click', async () => {
     const res = await fetch(`${REVIEW_API_BASE}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ testName, actions: payload }),
+      body: JSON.stringify({ testName, actions: payload, parentId }),
     });
     if (!res.ok) {
       const detail = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
@@ -240,6 +523,31 @@ generateBtn.addEventListener('click', async () => {
 });
 
 (async () => {
+  const fromRecording = new URLSearchParams(location.search).get('fromRecording');
+  if (fromRecording) {
+    // "Create a variant from this flow" (run.ts) — load a PAST recording by
+    // id instead of the single most-recent one, so QA can branch off any
+    // already-reviewed flow (e.g. to build a negative-path version) without
+    // disturbing the original.
+    try {
+      const res = await fetch(`${REVIEW_API_BASE}/api/recordings/${fromRecording}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const recording = (await res.json()) as { testName?: string; actions?: RecordedAction[] };
+      if (!recording.actions?.length) throw new Error('That recording has no actions.');
+      parentId = fromRecording;
+      testName = `${recording.testName || 'Untitled test'} (variant)`;
+      nameInput.value = testName;
+      actions = recording.actions;
+      render();
+    } catch (err) {
+      showAlert(
+        `Could not load recording ${fromRecording}: ${err instanceof Error ? err.message : String(err)}. Is the backend running at ${REVIEW_API_BASE}?`
+      );
+      generateBtn.disabled = true;
+    }
+    return;
+  }
+
   const { lastRecording } = (await chrome.storage.local.get('lastRecording')) as {
     lastRecording?: RecorderState;
   };

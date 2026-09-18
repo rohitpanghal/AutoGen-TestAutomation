@@ -6,6 +6,7 @@ import generateRoutes from './routes/generate.js';
 import recordingRoutes from './routes/recordings.js';
 import healRoutes from './routes/heal.js';
 import jobRoutes from './routes/jobs.js';
+import testRoutes from './routes/tests.js';
 
 const app = Fastify({ logger: true });
 
@@ -29,6 +30,7 @@ await app.register(generateRoutes);
 await app.register(recordingRoutes);
 await app.register(healRoutes);
 await app.register(jobRoutes);
+await app.register(testRoutes);
 
 const port = Number(process.env.PORT) || 4000;
 app.listen({ port }, (err) => {

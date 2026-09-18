@@ -14,7 +14,7 @@ import path from 'node:path';
 import { nanoid } from 'nanoid';
 import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
 import { runPlaywrightTest } from './testRunner.js';
-import { fixTest, type FixResult } from './anthropic.js';
+import { fixTest, extractFailingLocator, type FixResult } from './anthropic.js';
 import { getSession, type BreakPoint, type HealingSession } from './healingBrowser.js';
 import type { GeneratedTestCase, RecordedAction } from '../types.js';
 import type { TestRunResult } from './testRunner.js';
@@ -220,19 +220,43 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
   };
   if (!depsOverride && input.recordedActions?.length) {
     session = await getSession();
+    // A working copy the browser-agent path can patch as fixes land, kept
+    // separate from input.recordedActions (untouched, used for nothing
+    // else). Replaying the ORIGINAL recording verbatim on every attempt
+    // would just re-hit the same first break forever — baking each
+    // attempt's verifiedLocator into this copy is what lets a later
+    // re-replay actually get past an already-fixed step.
+    const workingActions = [...input.recordedActions];
     onEvent({ type: 'heal:browser', message: 'Replaying the recorded flow in a live browser…' });
-    const brk: BreakPoint = await session.replayUntilBroken(input.recordedActions);
-    const breakSummary = breakPhrase(brk);
-    const parkedMsg =
-      `Replay parked at recorded step #${brk.actionIndex} — ${breakSummary}` +
-      (brk.brokenLocatorExpr ? `: ${brk.brokenLocatorExpr}` : '');
-    console.log(`[heal] ${parkedMsg}`);
-    onEvent({ type: 'heal:browser', message: parkedMsg });
+    let brk: BreakPoint = await session.replayUntilBroken(workingActions);
+    let breakSummary = breakPhrase(brk);
+    const parkedMsg = (b: BreakPoint, summary: string) =>
+      `Replay parked at recorded step #${b.actionIndex} — ${summary}` + (b.brokenLocatorExpr ? `: ${b.brokenLocatorExpr}` : '');
+    console.log(`[heal] ${parkedMsg(brk, breakSummary)}`);
+    onEvent({ type: 'heal:browser', message: parkedMsg(brk, breakSummary) });
     const boundSession = session;
     deps = {
       run: (specFile) => runPlaywrightTest(specFile, signal),
-      fix: (testCase, code, failureOutput) =>
-        fixTest(
+      fix: async (testCase, code, failureOutput) => {
+        // The live browser stays parked wherever the FIRST replay left it —
+        // if an earlier attempt's fix resolved that step and the real test
+        // (run via runPlaywrightTest, not this simplified replay) now fails
+        // somewhere else, the parked page is stale: probing it can report
+        // "0 matches" for an element that simply hasn't been reached yet,
+        // not one that's actually gone. Only re-sync on positive evidence
+        // (a locator actually extracted from THIS run's failure, and it
+        // doesn't match where we're parked) — never guess.
+        const nowFailing = extractFailingLocator(failureOutput);
+        if (nowFailing && nowFailing !== brk.brokenLocatorExpr) {
+          const msg = 'Failure moved to a different step — re-syncing the live browser…';
+          console.log(`[heal] ${msg} (was: ${brk.brokenLocatorExpr ?? '(none)'}, now: ${nowFailing})`);
+          onEvent({ type: 'heal:browser', message: msg });
+          brk = await boundSession.replayUntilBroken(workingActions);
+          breakSummary = breakPhrase(brk);
+          console.log(`[heal] ${parkedMsg(brk, breakSummary)}`);
+          onEvent({ type: 'heal:browser', message: parkedMsg(brk, breakSummary) });
+        }
+        const result = await fixTest(
           testCase,
           code,
           failureOutput,
@@ -244,7 +268,17 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
             breakSummary,
           },
           signal
-        ),
+        );
+        // Bake this fix into the working copy so a FUTURE re-replay (above)
+        // reflects it instead of re-discovering the same original break.
+        if (result.verifiedLocator && !result.likelyRealBug && brk.actionIndex < workingActions.length) {
+          const action = workingActions[brk.actionIndex];
+          if (action.element) {
+            workingActions[brk.actionIndex] = { ...action, element: { ...action.element, suggestedLocator: result.verifiedLocator } };
+          }
+        }
+        return result;
+      },
     };
   }
 

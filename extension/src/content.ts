@@ -292,7 +292,7 @@ function getComparableText(el: Element): string | undefined {
 }
 
 function hasSameRoleAndText(el: Element, role: string | undefined, text: string | undefined): DuplicateCheck {
-  if (!text) return { ambiguous: false, hiddenDuplicate: false };
+  if (!text) return { ambiguous: false, hiddenDuplicate: false, count: 0 };
   const normalizedText = normalizeText(text).slice(0, 80);
   const matches: Element[] = [el];
   document.querySelectorAll('body *').forEach((candidate) => {
@@ -323,15 +323,21 @@ interface DuplicateCheck {
   // resolve, but Playwright's strict mode still counts hidden matches, so the
   // emitted locator needs a `.filter({ visible: true })` guard regardless.
   hiddenDuplicate: boolean;
+  // Total matches, including `el` itself -- "how many elements on the page
+  // this locator would resolve to" (self-inclusive, same semantics
+  // countXPathMatches already has). Feeds the review page's locator
+  // candidate list (buildLocatorCandidates below); the ambiguous/
+  // hiddenDuplicate flags above are all buildLeaf itself needs.
+  count: number;
 }
 
 function classifyMatches(el: Element, matches: Element[]): DuplicateCheck {
   const others = matches.filter((m) => m !== el);
-  return { ambiguous: others.length > 0, hiddenDuplicate: others.length > 0 && !others.some(isVisible) };
+  return { ambiguous: others.length > 0, hiddenDuplicate: others.length > 0 && !others.some(isVisible), count: matches.length };
 }
 
 function hasDuplicateId(el: Element): DuplicateCheck {
-  if (!el.id) return { ambiguous: false, hiddenDuplicate: false };
+  if (!el.id) return { ambiguous: false, hiddenDuplicate: false, count: 0 };
   const matches = Array.from(document.querySelectorAll(`[id="${CSS.escape(el.id)}"]`));
   return classifyMatches(el, matches);
 }
@@ -342,7 +348,7 @@ function hasDuplicateId(el: Element): DuplicateCheck {
 // getting data-testid="customButton" from the same base component.
 function hasDuplicateTestId(el: Element): DuplicateCheck {
   const testId = el.getAttribute('data-testid');
-  if (!testId) return { ambiguous: false, hiddenDuplicate: false };
+  if (!testId) return { ambiguous: false, hiddenDuplicate: false, count: 0 };
   const matches = Array.from(document.querySelectorAll(`[data-testid="${CSS.escape(testId)}"]`));
   return classifyMatches(el, matches);
 }
@@ -356,7 +362,7 @@ function hasDuplicateTestId(el: Element): DuplicateCheck {
 function hasDuplicateName(el: Element): DuplicateCheck {
   const name = (el as HTMLInputElement).name;
   if (!name || !['input', 'select', 'textarea'].includes(el.tagName.toLowerCase())) {
-    return { ambiguous: false, hiddenDuplicate: false };
+    return { ambiguous: false, hiddenDuplicate: false, count: 0 };
   }
   const tag = el.tagName.toLowerCase();
   const matches = Array.from(document.querySelectorAll(`${tag}[name="${CSS.escape(name)}"]`));
@@ -474,10 +480,142 @@ function getContainerHint(el: Element): ElementDescriptor['containerHint'] {
   return undefined;
 }
 
+// Only realistic for same-origin iframes: window.frameElement gives the
+// actual <iframe> DOM node in the PARENT document when same-origin, which
+// getCssSelector can compute a real selector for (it walks purely via
+// el.parentElement/el.tagName, so it works fine on a node from a different
+// document than the one this script happens to be running in). Cross-origin,
+// frameElement is null and there is no other way to identify which <iframe>
+// this is from the inside -- that case is reported (crossOrigin: true) rather
+// than guessed at here; the LLM gets a best-effort frameUrl hint instead (see
+// SYSTEM_PROMPT in anthropic.ts).
+// Computed once per script instance: a content script never survives a frame
+// navigation, so the frame chain can't change out from under a cached value.
+let frameChainCache: ElementDescriptor['frame'] | undefined | null = null;
+
+function getFrameChain(): ElementDescriptor['frame'] | undefined {
+  if (frameChainCache !== null) return frameChainCache ?? undefined;
+  if (window === window.top) {
+    frameChainCache = undefined;
+    return undefined;
+  }
+  const chain: string[] = [];
+  let win: Window = window;
+  let crossOrigin = false;
+  while (win !== win.top) {
+    let frameEl: Element | null;
+    try {
+      frameEl = win.frameElement;
+    } catch {
+      frameEl = null;
+    }
+    if (!frameEl) {
+      crossOrigin = true;
+      break;
+    }
+    chain.unshift(getCssSelector(frameEl));
+    win = win.parent;
+  }
+  frameChainCache = { selectorChain: crossOrigin ? [] : chain, crossOrigin, frameUrl: location.href };
+  return frameChainCache;
+}
+
+function countCssMatches(css: string): number {
+  try {
+    return document.querySelectorAll(css).length;
+  } catch {
+    return 0;
+  }
+}
+
+// Same quote/escape convention as locatorBuilder.ts's escapeStr+quoted
+// (backend/src/services/locatorBuilder.ts) -- these expressions are meant to
+// be pasted straight into a locatorOverride and used verbatim there, so they
+// need to look and behave exactly like the ones the server builds.
+function exprQuote(s: string): string {
+  return `'${normalizeText(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
+// Every viable way to point at this element, each with a real match count --
+// not just the one buildLeaf would auto-pick server-side. Shown on the
+// review page so QA can see the tradeoffs and pick one, or type their own.
+// Deliberately more permissive than buildLeaf about what counts as a
+// "candidate": an ambiguous one (count > 1) is still listed, just not
+// marked isDefault -- the count itself is the signal, hiding it would defeat
+// the point. Skipped entirely for a cross-origin-iframe element: there's no
+// trustworthy frame selector to build any of these on top of (same reasoning
+// suggestedLocator itself already applies).
+function buildLocatorCandidates(
+  ctx: {
+    tag: string;
+    css: string;
+    xpath?: string;
+    xpathIsAnchored: boolean;
+    testIdAttr?: string;
+    testIdCount: number;
+    name?: string;
+    type?: string;
+    nameCount: number;
+    role?: string;
+    ariaLabel?: string;
+    text?: string;
+    textTruncated: boolean;
+    roleTextCount: number;
+    textOnlyCount: number;
+    frame: ElementDescriptor['frame'];
+  }
+): LocatorCandidate[] {
+  if (ctx.frame?.crossOrigin) return [];
+  const framePrefix =
+    ctx.frame && ctx.frame.selectorChain.length > 0
+      ? `page${ctx.frame.selectorChain.map((s) => `.frameLocator(${exprQuote(s)})`).join('')}`
+      : 'page';
+
+  const candidates: LocatorCandidate[] = [];
+  if (ctx.testIdAttr) {
+    candidates.push({ kind: 'testId', expr: `${framePrefix}.getByTestId(${exprQuote(ctx.testIdAttr)})`, count: ctx.testIdCount });
+  }
+  if (['input', 'select', 'textarea'].includes(ctx.tag) && !['radio', 'checkbox'].includes(ctx.type ?? '') && ctx.name) {
+    candidates.push({
+      kind: 'name',
+      expr: `${framePrefix}.locator(${exprQuote(`${ctx.tag}[name="${ctx.name}"]`)})`,
+      count: ctx.nameCount,
+    });
+  }
+  if (ctx.role && (ctx.text || ctx.ariaLabel)) {
+    candidates.push({
+      kind: 'role',
+      expr: `${framePrefix}.getByRole(${exprQuote(ctx.role)}, { name: ${exprQuote(ctx.ariaLabel || ctx.text!)} })`,
+      count: ctx.roleTextCount,
+    });
+  }
+  if (ctx.text) {
+    candidates.push({
+      kind: 'text',
+      expr: `${framePrefix}.getByText(${exprQuote(ctx.text)}, { exact: ${!ctx.textTruncated} })`,
+      count: ctx.textOnlyCount,
+    });
+  }
+  candidates.push({ kind: 'css', expr: `${framePrefix}.locator(${exprQuote(ctx.css)})`, count: countCssMatches(ctx.css) });
+  if (ctx.xpathIsAnchored && ctx.xpath) {
+    candidates.push({
+      kind: 'xpath',
+      expr: `${framePrefix}.locator(${exprQuote(`xpath=${ctx.xpath}`)})`,
+      count: countXPathMatches(ctx.xpath),
+    });
+  }
+
+  const uniqueIdx = candidates.findIndex((c) => c.count === 1);
+  const defaultIdx = uniqueIdx >= 0 ? uniqueIdx : 0;
+  if (candidates[defaultIdx]) candidates[defaultIdx] = { ...candidates[defaultIdx], isDefault: true };
+  return candidates;
+}
+
 function buildElementDescriptor(el: Element): ElementDescriptor {
   const tag = el.tagName.toLowerCase();
   const role = getImplicitRole(el);
   const ariaLabel = el.getAttribute('aria-label') || undefined;
+  const testIdAttr = el.getAttribute('data-testid') || undefined;
   const nearbyText = getNearbyText(el);
   const fullText = (el as HTMLElement).innerText?.trim();
   const text = fullText?.slice(0, 80) || undefined;
@@ -510,13 +648,38 @@ function buildElementDescriptor(el: Element): ElementDescriptor {
   // scoping only kicks in when ambiguous anyway. Anchored xpath exists for the
   // remaining gap -- no testid, no unambiguous role+name/text, and (checked
   // below via containerHint) no CSS class anywhere up the tree either.
-  const needsXPathFallback = !el.getAttribute('data-testid') && (!role || !text || roleTextAmbiguous);
+  const needsXPathFallback = !testIdAttr && (!role || !text || roleTextAmbiguous);
   const anchoredXPath = needsXPathFallback ? getTextAnchoredXPath(el) : undefined;
+  const css = getCssSelector(el);
+  const xpath = anchoredXPath ?? getXPath(el);
+  const xpathIsAnchored = Boolean(anchoredXPath);
+  const frame = getFrameChain();
+  // A pure text-only count (no role filter) for the getByText candidate --
+  // hasSameRoleAndText already does exactly this when called with no role.
+  const textOnlyCount = text ? hasSameRoleAndText(el, undefined, text).count : 0;
+  const locatorCandidates = buildLocatorCandidates({
+    tag,
+    css,
+    xpath,
+    xpathIsAnchored,
+    testIdAttr,
+    testIdCount: testId.count,
+    name,
+    type,
+    nameCount: nameDup.count,
+    role,
+    ariaLabel,
+    text,
+    textTruncated,
+    roleTextCount: roleText.count,
+    textOnlyCount,
+    frame,
+  });
 
   // Predicts which leaf buildLeaf will choose server-side, so getLandmark can
   // verify a candidate ancestor against that SAME leaf instead of guessing.
   const leaf = resolveLeafPrediction({
-    testId: el.getAttribute('data-testid') || undefined,
+    testId: testIdAttr,
     testIdAmbiguous,
     role,
     text,
@@ -541,17 +704,19 @@ function buildElementDescriptor(el: Element): ElementDescriptor {
     ariaLabel,
     text,
     textTruncated,
-    css: getCssSelector(el),
-    xpath: anchoredXPath ?? getXPath(el),
-    xpathIsAnchored: Boolean(anchoredXPath),
+    css,
+    xpath,
+    xpathIsAnchored,
     nearbyText,
-    testId: el.getAttribute('data-testid') || undefined,
+    testId: testIdAttr,
     landmark: leaf.needsScope ? getLandmark(el, leaf) : undefined,
     ambiguous,
     testIdAmbiguous,
     roleTextAmbiguous,
     hiddenDuplicate,
     containerHint: ambiguous ? getContainerHint(el) : undefined,
+    frame,
+    locatorCandidates,
   };
 }
 
@@ -561,11 +726,190 @@ function send(action: RecordedAction) {
   });
 }
 
+// Element picker: lets the review screen ask "what does QA want to point at"
+// against a LIVE page (retargeting a step, or picking the element for a new
+// step) instead of a hand-edited selector string. Independent of recording —
+// active any time background sends ENTER_PICK_MODE, whether or not a
+// recording is in progress.
+//
+// Two-state, not one: `pickModeActive` means the session is live (banner
+// shown) but clicks behave normally -- QA needs to click through the app
+// first to reach a target that doesn't exist yet (open a dropdown, submit a
+// step, navigate to another page entirely). Only `pickArmed` (set by the
+// banner's "Target next click" button) makes the *next* click the pick.
+// Because a real navigation can happen while just browsing, and a fresh page
+// load resets all of this module's state, background.ts re-sends
+// ENTER_PICK_MODE after every navigation for as long as the session is
+// active -- enterPickMode() is written to be safely re-entrant for that.
+let pickModeActive = false;
+let pickArmed = false;
+let pickRequestId = '';
+let pickBanner: HTMLElement | undefined;
+let pickHoverTarget: Element | undefined;
+let pickHoverPrevOutline = '';
+
+function pickInteractiveTarget(el: Element): Element {
+  return (
+    el.closest('button, a, [role="button"], input, select, textarea, [onclick]') ?? el
+  );
+}
+
+function onPickMouseOver(e: MouseEvent) {
+  const raw = e.target;
+  if (!(raw instanceof Element)) return;
+  const target = pickInteractiveTarget(raw);
+  if (target === pickHoverTarget) return;
+  if (pickHoverTarget) (pickHoverTarget as HTMLElement).style.outline = pickHoverPrevOutline;
+  pickHoverTarget = target;
+  pickHoverPrevOutline = (target as HTMLElement).style.outline;
+  (target as HTMLElement).style.outline = '2px solid #0969da';
+}
+
+function clearHover() {
+  if (!pickHoverTarget) return;
+  (pickHoverTarget as HTMLElement).style.outline = pickHoverPrevOutline;
+  pickHoverTarget = undefined;
+}
+
+function renderPickBanner() {
+  if (!pickBanner) return;
+  pickBanner.innerHTML = '';
+  const text = document.createElement('span');
+  text.textContent = pickArmed
+    ? 'AI Test Recorder — click the element to use.'
+    : 'AI Test Recorder — get to the right screen, then click "Target next click".';
+  const btn = (label: string, onClick: () => void) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    Object.assign(b.style, {
+      marginLeft: '10px',
+      border: '1px solid #fff',
+      background: 'transparent',
+      color: '#fff',
+      borderRadius: '4px',
+      padding: '3px 9px',
+      cursor: 'pointer',
+      font: 'inherit',
+    } satisfies Partial<CSSStyleDeclaration>);
+    b.addEventListener('click', onClick);
+    return b;
+  };
+  pickBanner.appendChild(text);
+  if (pickArmed) {
+    pickBanner.appendChild(btn('Stop targeting', disarmPick));
+  } else {
+    pickBanner.appendChild(btn('Target next click', armPick));
+  }
+  pickBanner.appendChild(btn('Cancel', cancelPick));
+}
+
+function armPick() {
+  pickArmed = true;
+  document.addEventListener('mouseover', onPickMouseOver, true);
+  renderPickBanner();
+}
+
+function disarmPick() {
+  pickArmed = false;
+  clearHover();
+  document.removeEventListener('mouseover', onPickMouseOver, true);
+  renderPickBanner();
+}
+
+// Local teardown only -- does not tell background to stop re-arming (a real
+// navigation calls this indirectly by just... not being called at all, since
+// the module reloads; see enterPickMode). Cancel is what tells background.
+function exitPickMode() {
+  pickModeActive = false;
+  disarmPick();
+  pickRequestId = '';
+  pickBanner?.remove();
+  pickBanner = undefined;
+}
+
+function cancelPick() {
+  chrome.runtime.sendMessage({ type: 'CANCEL_PICK', requestId: pickRequestId }).catch(() => {});
+  exitPickMode();
+}
+
+// Re-entrant: background calls this again after every navigation for the
+// life of the session, since a fresh page load wipes this module's state.
+function enterPickMode(requestId: string) {
+  pickModeActive = true;
+  pickArmed = false;
+  pickRequestId = requestId;
+  if (!pickBanner) {
+    pickBanner = document.createElement('div');
+    Object.assign(pickBanner.style, {
+      position: 'fixed',
+      top: '0',
+      left: '0',
+      right: '0',
+      zIndex: '2147483647',
+      background: '#0969da',
+      color: '#fff',
+      font: '13px -apple-system, sans-serif',
+      padding: '8px 14px',
+      textAlign: 'center',
+    } satisfies Partial<CSSStyleDeclaration>);
+    document.documentElement.appendChild(pickBanner);
+  }
+  renderPickBanner();
+}
+
+chrome.runtime.onMessage.addListener((message: ExtensionMessage) => {
+  if (message.type === 'ENTER_PICK_MODE') enterPickMode(message.requestId);
+});
+
+// Only semantically meaningful keys, not every keystroke: character input is
+// already captured wholesale by the 'change' listener's recorded `value`
+// (Playwright fills a value in one shot, so per-keystroke replay would add
+// noise with no codegen benefit). Enter/Escape/Tab are the ones a flow can
+// depend on with no corresponding click/change event of their own.
+const RECORDED_KEYS = new Set(['Enter', 'Escape', 'Tab']);
+
+document.addEventListener(
+  'keydown',
+  (e) => {
+    if (pickModeActive) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelPick();
+      }
+      return;
+    }
+    if (!RECORDED_KEYS.has(e.key)) return;
+    const target = e.target;
+    send({
+      action: 'keydown',
+      timestamp: Date.now(),
+      url: location.href,
+      element: target instanceof Element ? buildElementDescriptor(target) : undefined,
+      value: e.key === 'Tab' && e.shiftKey ? 'Shift+Tab' : e.key,
+    });
+  },
+  true
+);
+
 document.addEventListener(
   'click',
   (e) => {
     const raw = e.target;
     if (!(raw instanceof Element)) return;
+    if (pickArmed) {
+      e.preventDefault();
+      e.stopPropagation();
+      const target = pickInteractiveTarget(raw);
+      chrome.runtime.sendMessage({
+        type: 'ELEMENT_PICKED',
+        requestId: pickRequestId,
+        element: buildElementDescriptor(target),
+        url: location.href,
+      }).catch(() => {});
+      exitPickMode();
+      return;
+    }
     const interactive = raw.closest(
       'button, a, [role="button"], input[type="checkbox"], input[type="radio"], input[type="submit"], [onclick]'
     );
@@ -583,8 +927,23 @@ document.addEventListener(
 document.addEventListener(
   'change',
   (e) => {
+    if (pickModeActive) return;
     const el = e.target;
     if (!(el instanceof HTMLInputElement) && !(el instanceof HTMLSelectElement) && !(el instanceof HTMLTextAreaElement)) {
+      return;
+    }
+    // A file input's .value is browser-redacted to "C:\fakepath\<name>" for
+    // security -- there is no JS API that exposes the real absolute path.
+    // Record what we can (the descriptor + the filename as a display-only
+    // label) and let the human supply the real path on the review screen.
+    if (el instanceof HTMLInputElement && el.type === 'file') {
+      send({
+        action: 'upload',
+        timestamp: Date.now(),
+        url: location.href,
+        element: buildElementDescriptor(el),
+        value: el.files?.[0]?.name ?? '',
+      });
       return;
     }
     const tag = el.tagName.toLowerCase();

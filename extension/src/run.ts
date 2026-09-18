@@ -13,6 +13,11 @@ function $<T extends HTMLElement>(id: string): T {
 const phaseBadge = $<HTMLSpanElement>('phase-badge');
 const testTitleEl = $<HTMLDivElement>('test-title');
 const alertEl = $<HTMLElement>('alert');
+const approvalSection = $<HTMLElement>('approval-section');
+const approveTitleInput = $<HTMLInputElement>('approve-title');
+const approveStepsEl = $<HTMLOListElement>('approve-steps');
+const approveCodeEl = $<HTMLTextAreaElement>('approve-code');
+const approveBtn = $<HTMLButtonElement>('approve-btn');
 const summarySection = $<HTMLElement>('summary-section');
 const summaryStepsEl = $<HTMLUListElement>('summary-steps');
 const diffSection = $<HTMLElement>('diff-section');
@@ -25,16 +30,28 @@ const logEl = $<HTMLDivElement>('log');
 
 const copyBtn = $<HTMLButtonElement>('copy-btn');
 const rehealBtn = $<HTMLButtonElement>('reheal-btn');
+const variantBtn = $<HTMLButtonElement>('variant-btn');
 const cancelBtn = $<HTMLButtonElement>('cancel-btn');
 const closeBtn = $<HTMLButtonElement>('close-btn');
 
-interface DonePayload {
-  id: string;
-  testCase?: { title?: string; steps?: { description: string; expectedResult?: string }[] };
-  working: boolean;
-  finalCode: string;
-  healing: { status: string; attempts: number; suspectedRealBug: boolean };
-}
+type StepEdit = { description: string; expectedResult?: string };
+type TestCasePayload = { title?: string; preconditions?: string[]; steps?: StepEdit[]; expectedResults?: string[] };
+
+// A bare-generate job's `done` stops here for QA review instead of
+// auto-healing (backend/src/routes/generate.ts::runGenerateJob); a heal job's
+// `done` (the initial Approve & run, or a later Re-heal) carries the real
+// result. Discriminated on awaitingApproval so each branch below narrows
+// without needing non-null assertions.
+type DonePayload =
+  | { id: string; testCase?: TestCasePayload; playwrightCode?: string; specFile?: string; awaitingApproval: true }
+  | {
+      id: string;
+      testCase?: TestCasePayload;
+      awaitingApproval?: false;
+      working: boolean;
+      finalCode: string;
+      healing: { status: string; attempts: number; suspectedRealBug: boolean };
+    };
 
 let streamId = '';
 let recordId = ''; // storage id for Re-heal — equals streamId for a generate job
@@ -44,6 +61,10 @@ let running = true;
 let receivedAny = false;
 let ended = false;
 let source: EventSource | undefined;
+// Full testCase from the last 'generated'/'done' event, kept around so
+// approveBtn can PATCH back a complete object (preconditions/expectedResults
+// aren't editable here, but the schema still requires them).
+let currentTestCase: Required<TestCasePayload> | undefined;
 
 function setBadge(text: string, cls = '') {
   phaseBadge.textContent = text;
@@ -139,6 +160,81 @@ function renderDiff(a: string, b: string) {
   show(diffSection);
 }
 
+function normalizeTestCase(tc: TestCasePayload | undefined): Required<TestCasePayload> {
+  return {
+    title: tc?.title ?? '',
+    preconditions: tc?.preconditions ?? [],
+    steps: tc?.steps ?? [],
+    expectedResults: tc?.expectedResults ?? [],
+  };
+}
+
+// QA's review/edit panel — shown once a bare-generate job's `done` event
+// arrives with awaitingApproval: true (backend/src/routes/generate.ts stops
+// there deliberately). Nothing has run yet; "Approve & run" PATCHes any edits
+// to /api/tests/:id, then POSTs /api/heal/:id exactly like Re-heal does.
+function renderApproval(d: Extract<DonePayload, { awaitingApproval: true }>) {
+  currentTestCase = normalizeTestCase(d.testCase);
+  recordId = d.id;
+  originalCode = d.playwrightCode ?? '';
+
+  approveTitleInput.value = currentTestCase.title;
+  approveStepsEl.innerHTML = '';
+  currentTestCase.steps.forEach((step, i) => {
+    const li = document.createElement('li');
+    const desc = document.createElement('input');
+    desc.className = 'step-desc';
+    desc.value = step.description;
+    desc.addEventListener('input', () => { currentTestCase!.steps[i] = { ...currentTestCase!.steps[i], description: desc.value }; });
+    const expected = document.createElement('input');
+    expected.className = 'step-expected';
+    expected.placeholder = 'Expected result (optional)';
+    expected.value = step.expectedResult ?? '';
+    expected.addEventListener('input', () => { currentTestCase!.steps[i] = { ...currentTestCase!.steps[i], expectedResult: expected.value }; });
+    li.append(desc, expected);
+    approveStepsEl.appendChild(li);
+  });
+  approveCodeEl.value = originalCode;
+
+  // Avoid a confusing duplicate: the read-only preview shown while generation
+  // streamed in is redundant with the editable panel now.
+  codeSection.classList.add('hidden');
+  summarySection.classList.add('hidden');
+
+  cancelBtn.disabled = true;
+  copyBtn.disabled = false;
+  setBadge('Awaiting review', 'running');
+  show(approvalSection);
+  logLine('Generated — review the test case and code above, then approve to run it.');
+}
+
+approveBtn.addEventListener('click', async () => {
+  if (!recordId || !currentTestCase) return;
+  approveBtn.disabled = true;
+  const originalLabel = approveBtn.textContent;
+  approveBtn.textContent = 'Starting…';
+  try {
+    currentTestCase.title = approveTitleInput.value.trim() || currentTestCase.title;
+    const code = approveCodeEl.value;
+    const patchRes = await fetch(`${API_BASE}/api/tests/${recordId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playwrightCode: code, testCase: currentTestCase }),
+    });
+    if (!patchRes.ok) throw new Error(`Saving edits failed: HTTP ${patchRes.status}`);
+
+    const healRes = await fetch(`${API_BASE}/api/heal/${recordId}`, { method: 'POST' });
+    if (!healRes.ok) throw new Error(`Starting the run failed: HTTP ${healRes.status}`);
+    const { id } = (await healRes.json()) as { id: string };
+    location.search = `?id=${id}`; // reload fresh against the new heal job, same as Re-heal
+  } catch (err) {
+    approveBtn.disabled = false;
+    approveBtn.textContent = originalLabel;
+    alertEl.textContent = `Could not start the run: ${err instanceof Error ? err.message : String(err)}`;
+    show(alertEl);
+  }
+});
+
 function addDiagnosis(attempt: number, text: string, realBug: boolean) {
   const li = document.createElement('li');
   li.textContent = `Attempt ${attempt}: ${text}`;
@@ -157,6 +253,9 @@ function finish(kind: 'passed' | 'failed' | 'error' | 'cancelled', message?: str
   cancelBtn.disabled = true;
   copyBtn.disabled = !(finalCode || originalCode);
   rehealBtn.disabled = !recordId;
+  // A variant only makes sense once QA has seen the flow actually run —
+  // not on a cancelled/errored job, which never produced a real result.
+  if (recordId && (kind === 'passed' || kind === 'failed')) variantBtn.classList.remove('hidden');
   if (kind === 'passed') setBadge('Passed', 'passed');
   else if (kind === 'failed') setBadge('Needs review', 'failed');
   else if (kind === 'cancelled') setBadge('Cancelled', 'cancelled');
@@ -246,6 +345,10 @@ function attach(id: string) {
   source.addEventListener('done', (e) => {
     const d = JSON.parse((e as MessageEvent).data) as DonePayload;
     receivedAny = true;
+    if (d.awaitingApproval) {
+      renderApproval(d);
+      return;
+    }
     recordId = d.id || recordId;
     finalCode = d.finalCode || finalCode;
     renderSummary(d.testCase);
@@ -299,7 +402,8 @@ function attach(id: string) {
 }
 
 copyBtn.addEventListener('click', () => {
-  navigator.clipboard.writeText(finalCode || originalCode || '');
+  const text = approvalSection.classList.contains('hidden') ? finalCode || originalCode : approveCodeEl.value;
+  navigator.clipboard.writeText(text || '');
   copyBtn.textContent = 'Copied';
   setTimeout(() => (copyBtn.textContent = 'Copy code'), 1200);
 });
@@ -327,6 +431,11 @@ rehealBtn.addEventListener('click', async () => {
     alertEl.textContent = `Could not start re-heal: ${err instanceof Error ? err.message : String(err)}`;
     show(alertEl);
   }
+});
+
+variantBtn.addEventListener('click', () => {
+  if (!recordId) return;
+  chrome.tabs.create({ url: chrome.runtime.getURL(`pages/review.html?fromRecording=${recordId}`) });
 });
 
 closeBtn.addEventListener('click', () => window.close());

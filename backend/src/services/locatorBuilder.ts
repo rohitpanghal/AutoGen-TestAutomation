@@ -103,26 +103,51 @@ function buildContainerScope(hint: ContainerHint): string {
   return `${base}.filter({ hasText: ${quoted(hint.text)} })`;
 }
 
-// Returns a full "page.xxx" Playwright locator expression. Only wraps the leaf
-// in landmark/containerHint scoping when the CHOSEN leaf strategy is itself
-// non-unique — e.g. if role+name already disambiguates (buildLeaf skipped a
-// duplicated testId in favor of it), wrapping it further would just add noise.
-export function buildLocatorExpression(el: ElementDescriptor): string {
+// An element captured inside an iframe needs its locator scoped through a
+// frameLocator(...) chain before anything else. Same-origin frames give us a
+// real, verified-computable selector for each ancestor <iframe> (selectorChain,
+// outermost first — see content.ts's getFrameChain); cross-origin frames give
+// us nothing to hook into from inside, so there's no trustworthy "page.xxx"
+// prefix to hand the LLM as a fact — buildLocatorExpression signals that by
+// returning undefined rather than a guessed expression.
+function framePrefix(el: ElementDescriptor): string | undefined {
+  if (!el.frame) return 'page';
+  if (el.frame.crossOrigin || el.frame.selectorChain.length === 0) return undefined;
+  return `page${el.frame.selectorChain.map((sel) => `.frameLocator(${quoted(sel)})`).join('')}`;
+}
+
+// Returns a full "page.xxx" (or "page.frameLocator(...)....xxx") Playwright
+// locator expression, or undefined when the element was captured inside a
+// cross-origin iframe and no reliable frame selector can be computed — code
+// shouldn't hand the LLM a fake "fact" to copy verbatim in that case. Only
+// wraps the leaf in landmark/containerHint scoping when the CHOSEN leaf
+// strategy is itself non-unique — e.g. if role+name already disambiguates
+// (buildLeaf skipped a duplicated testId in favor of it), wrapping it further
+// would just add noise.
+export function buildLocatorExpression(el: ElementDescriptor): string | undefined {
+  // QA's explicit choice (the review page's candidate list, or typed
+  // directly) wins verbatim, before frame-prefixing, leaf-building, or the
+  // hiddenDuplicate .filter — no exceptions. Same "human override wins
+  // outright" contract description/filePath already have elsewhere in this
+  // pipeline.
+  if (el.locatorOverride?.trim()) return el.locatorOverride.trim();
+  const prefix = framePrefix(el);
+  if (!prefix) return undefined;
   const { expr, needsScope } = buildLeaf(el);
-  let base = `page.${expr}`;
+  let base = `${prefix}.${expr}`;
   if (needsScope) {
     // A landmark testId is a stable, purpose-built hook — always more specific
     // than a containerHint's class+hasText guess, so it wins when available.
-    if (el.landmark?.testId) base = `page.${buildLandmarkScope(el.landmark)}.${expr}`;
-    else if (el.containerHint) base = `page.${buildContainerScope(el.containerHint)}.${expr}`;
-    else if (el.landmark) base = `page.${buildLandmarkScope(el.landmark)}.${expr}`;
+    if (el.landmark?.testId) base = `${prefix}.${buildLandmarkScope(el.landmark)}.${expr}`;
+    else if (el.containerHint) base = `${prefix}.${buildContainerScope(el.containerHint)}.${expr}`;
+    else if (el.landmark) base = `${prefix}.${buildLandmarkScope(el.landmark)}.${expr}`;
     else {
       // No CSS class or landmark anywhere up the tree to scope through — the
       // gap an automation-unfriendly app forces us into. Anchored xpath can
       // still resolve it via the ancestor axis, which plain CSS has no way to
       // express without a class to hook into.
       const xpath = xpathLeaf(el);
-      if (xpath) base = `page.${xpath}`;
+      if (xpath) base = `${prefix}.${xpath}`;
     }
   }
   // hiddenDuplicate means a hasText/role/testid scope narrows *which* copy of
@@ -136,6 +161,10 @@ export function buildLocatorExpression(el: ElementDescriptor): string {
 export function enrichActions(actions: RecordedAction[]): RecordedAction[] {
   return actions.map((action) => {
     if (!action.element) return action;
-    return { ...action, element: { ...action.element, suggestedLocator: buildLocatorExpression(action.element) } };
+    const suggestedLocator = buildLocatorExpression(action.element);
+    return {
+      ...action,
+      element: suggestedLocator ? { ...action.element, suggestedLocator } : action.element,
+    };
   });
 }

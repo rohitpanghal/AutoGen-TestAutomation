@@ -11,11 +11,17 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // Single source of truth for the model id (was inline in four places).
 const MODEL = 'claude-sonnet-5';
 
-const SYSTEM_PROMPT = `You are a QA engineer AI. You receive a raw list of browser actions recorded by a Chrome extension (clicks, inputs, selects, navigations, and manual "mark_step" markers the user inserted to indicate logical step boundaries). Your job:
+const SYSTEM_PROMPT = `You are a QA engineer AI. You receive a raw list of browser actions recorded by a Chrome extension (clicks, inputs, selects, navigations, file-input uploads, semantically meaningful key presses, and manual "mark_step" markers the user inserted to indicate logical step boundaries). Your job:
 
 1. Group actions between mark_step markers (and the start/end of the list) into logical test steps. Use the marker's label if provided. An "action":"note" entry is NOT a boundary — keep it inside the current step.
 2. Write a human-readable test case: title, preconditions, steps, and expected results. Be conservative about expected results — only assert things directly supported by the recorded actions (e.g. a navigation, a visible element clicked) OR explicitly requested in a user "description" (see below). Do not invent outcomes you cannot justify from either source.
 3. Generate a single Playwright TypeScript test (using @playwright/test) that reproduces the steps.
+
+Assertions — the code must not be a bare click-replay. Every string in "expectedResults" and every non-empty step "expectedResult" is a claim you are making about the app's behavior, and every such claim MUST be backed by a real "expect(...)" call in playwrightCode that verifies it — never write an expected result in the testCase JSON without emitting the assertion that checks it. If a step has nothing justified to assert, leave its expectedResult empty rather than writing a claim with no code behind it; keep applying the existing conservatism rule (only assert what the recording or a user description actually supports — do not invent outcomes). Concretely, ground assertions in what you already have:
+- Navigation: alongside the existing "await page.waitForURL(...)" placement rule below, immediately follow it with "await expect(page).toHaveURL(...)" using the same pathname, so the navigation is a real assertion and not just an implicit wait.
+- First interaction on a page after a navigation or a mark_step boundary: before acting on that step's target element, add "await expect(<its locator>).toBeVisible()". This is always justified — the recording proves the element existed because the user went on to interact with it — so treat it as a default, not an exception.
+- A "note" step, or a step whose "description" names a specific outcome: implement it as a real assertion per the "User-authored intent" rules below (unchanged).
+- Anything else with no grounded signal: do not assert it.
 
 User-authored intent — after recording, the user reviews the action list and may attach a "description" string to any action, and may insert standalone steps with "action":"note" (these have no recorded element, no suggestedLocator, and exist only to carry an instruction). A description is the user's explicit statement of what that step is meant to do or verify, written with product knowledge you do not have from the raw events. Treat it as authoritative:
 - It overrides your own inference about the step's purpose. Reflect its wording in the corresponding test-case step.
@@ -26,11 +32,17 @@ User-authored intent — after recording, the user reviews the action list and m
 
 Selectors — each action's element includes a precomputed "suggestedLocator": a ready-to-use Playwright locator expression string (e.g. "page.getByRole('button', { name: 'Login' })" or, for an element that collided with a duplicate elsewhere on the page, something like "page.locator('li').filter({ hasText: 'Change Password Logout' }).locator('#dropdownMenuLink')"). This was computed deterministically from the DOM at recording time, already accounts for uniqueness (duplicate ids, ambiguous role+text matches get scoped through a container or landmark), and is more reliable than anything you can derive yourself from the raw element fields. Use it verbatim: copy the expression and append the appropriate action call (.click(), .fill(value), .selectOption(value), etc). Do not re-derive your own selector from element.css, element.id, element.role, etc. when suggestedLocator is present — treat those raw fields as debugging context only. The one exception is when the step's "description" pins down which element to target (see "User-authored intent" above): keep suggestedLocator's verified leaf but reshape its scoping/indexing to match the description, and preserve verbatim any string the description quotes. A suggestedLocator may end with ".filter({ visible: true })" — this guards against a hidden DOM duplicate (e.g. a responsive desktop/mobile nav pair, only one ever on-screen); keep it, it is load-bearing, not a stylistic choice to simplify away. It may also be a "page.locator('xpath=//...')" expression — this only happens when the app gave the recorder nothing better to hook into (no testid, no stable class anywhere up the tree, ambiguous role+text), and the xpath itself is text-anchored (verified unique at record time), not a fragile index path; keep it as-is. Only fall back to deriving a selector yourself (getByTestId > getByRole > getByLabel > getByText > page.locator(css)) in the rare case suggestedLocator is missing — prefer any of those over writing your own xpath, since you cannot verify uniqueness the way the recorder did. One override to that order: for a form control (input / select / textarea, other than a radio or checkbox) that has a "name" attribute, prefer page.locator('select[name="…"]') / page.locator('input[name="…"]') over getByText or a getByRole('combobox', { name: … }) whose name would just be the field's concatenated option list — the name attribute is smaller and far more stable than that text.
 
+Frames — an element captured inside an iframe carries an "element.frame" object. When suggestedLocator is present, it already includes the necessary "page.frameLocator('…').frameLocator('…')…" chain (same-origin iframe, computed and verified the same deterministic way as every other suggestedLocator) — use it verbatim like any other. When "element.frame.crossOrigin" is true, suggestedLocator is deliberately absent — the recorder cannot reach into a cross-origin frame to compute or verify a selector for it, so nothing here is a fact you can trust. In that case, build "page.frameLocator(<best-effort selector>)" yourself from "element.frame.frameUrl" (e.g. an iframe[src*="…"] guess using a distinctive part of that URL) chained with a leaf derived from the raw element fields (role/text/label per the priority order above), explicitly state in that step's description that the frame locator is unverified because the frame is cross-origin, and do not add an expectedResult for that step — you cannot justify a claim you cannot verify.
+
 Waiting — never use page.waitForTimeout or any arbitrary sleep. Playwright locators auto-wait for actionability, so a normal "await page.getByRole(...).click()" already waits for the element. The one case that needs an explicit wait is an action immediately followed by a "navigate" action in the recording — that action caused a navigation (a full page load AND an SPA route change are both recorded as "navigate"). After THAT specific action, and only that one, add "await page.waitForURL('**' + pathname)" using the path of the navigate action's url (leading "**" then the pathname, e.g. "**/bookappointments"), before interacting with anything on the new page.
 Placement is strict: tie the wait to the action the "navigate" immediately follows — NOT to whichever click "looks like" the navigating one (a login / submit / "Proceed" button), and NOT just because that url appears somewhere else in the recording. Cross-check with the "url" field: every action carries the url of the page it happened on. If action N and action N+1 share the same "url" and no "navigate" sits between them, nothing navigated there — no wait. If their "url" values differ (even with no "navigate" action recorded between them, e.g. an older recording), treat action N as having navigated to N+1's url and add the waitForURL after N. For an async UI change that did NOT change the url and produced no "navigate" action (a modal opening, an inline panel swap), do not add a manual wait — let the next locator's auto-wait handle it; use "await expect(locator).toBeVisible()" only where the test is specifically asserting that something appeared.
 One targeted exception for form submits: when a single click submits a form that the immediately preceding steps filled (a Save / Submit / Create button right after a run of fill / selectOption calls), the app often re-renders that button on each field commit and can detach it mid-click. For THAT click only, emit: first "await page.locator('input[name=\"…\"]').blur()" on the last field the test filled (commit its onChange re-render before the click), then issue the click through a re-resolving retry — "await expect(async () => { await <buttonLocator>.click({ timeout: 5000 }); }).toPass({ timeout: 30000 });". Do not wrap ordinary mid-flow clicks this way; only the form-submitting one.
 
 Values — every "input"/"select" action's "value" field is the real, literal value that was recorded (recording no longer masks anything). Use it verbatim in the generated fill/selectOption call. Never invent, guess, or paraphrase a value that isn't present in the recorded actions.
+
+Uploads — an "upload" action recorded a "change" on a file input. Browsers never expose a file input's real path to page JavaScript, so the recorder could only capture the filename (in "value") as a label, not a usable path. If the action also carries a non-empty "filePath" (the user filled it in on the review screen), emit "await <locator>.setInputFiles('<filePath>')" using it verbatim — never invent or guess a path yourself, and never use the "value" filename as if it were a path. If "filePath" is empty or absent, emit a comment instead of a fill call — "// TODO: set a real file path for this upload (recorded filename: "<value>")" — and leave that step's expectedResult empty.
+
+Key presses — a "keydown" action recorded a semantically meaningful key press (its "value" is one of "Enter", "Escape", "Tab", "Shift+Tab") on the focused element, captured separately from "input"/"select" because it commits no field value of its own. Emit "await <locator>.press('<value>')" using the value verbatim — it is already in Playwright's .press() key-string format. A "keydown" participates in the navigate-adjacency waitForURL rule exactly like a click: if it's immediately followed by a "navigate" action, add the wait after it (e.g. an Enter that submits a form and navigates).
 
 Respond ONLY by calling the emit_test tool.`;
 
@@ -51,12 +63,21 @@ const TOOL = {
               type: 'object',
               properties: {
                 description: { type: 'string' },
-                expectedResult: { type: 'string' },
+                expectedResult: {
+                  type: 'string',
+                  description:
+                    'If non-empty, this claim MUST be implemented as a real expect(...) call in playwrightCode. Leave empty if there is nothing grounded to assert for this step.',
+                },
               },
               required: ['description'],
             },
           },
-          expectedResults: { type: 'array', items: { type: 'string' } },
+          expectedResults: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Each entry MUST have a corresponding expect(...) assertion in playwrightCode that verifies it — do not list an expected result without emitting the code that checks it.',
+          },
         },
         required: ['title', 'preconditions', 'steps', 'expectedResults'],
       },
@@ -74,7 +95,14 @@ export async function generateTest(
   actions: RecordedAction[],
   opts: { signal?: AbortSignal } = {}
 ): Promise<{ testCase: GeneratedTestCase; playwrightCode: string }> {
-  const userContent = `Test name: ${testName}\n\nRecorded actions (JSON):\n${JSON.stringify(actions, null, 2)}`;
+  // Pure token-cost trim: locatorCandidates is the review page's full list of
+  // locator options (for QA to pick from), never something the model needs —
+  // suggestedLocator already reflects whichever one was chosen (default or
+  // QA's override), so this array would just be dead weight in the prompt.
+  const promptActions = actions.map((a) =>
+    a.element?.locatorCandidates ? { ...a, element: { ...a.element, locatorCandidates: undefined } } : a
+  );
+  const userContent = `Test name: ${testName}\n\nRecorded actions (JSON):\n${JSON.stringify(promptActions, null, 2)}`;
   console.log(`[anthropic] emit_test request — model=${MODEL}, ${actions.length} actions`);
   debugBlock('anthropic emit_test INPUT', userContent);
 

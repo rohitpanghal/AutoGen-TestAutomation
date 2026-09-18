@@ -47,6 +47,15 @@ Design choices, and why:
   uniqueness in prose. Handing Claude a precomputed, correct locator string to
   copy verbatim turned out far more reliable than telling it "don't use a bare
   `#id` if it's ambiguous."
+- **Generated specs assert, not just replay.** The prompt requires every claim
+  in `testCase.expectedResults` / a step's `expectedResult` to be backed by a
+  real `expect(...)` in the generated code — grounded in what the recording
+  already proves (a navigation → `expect(page).toHaveURL(...)`, the first
+  element interacted with after a navigation/step boundary →
+  `expect(locator).toBeVisible()`, plus whatever a step's user-authored
+  `description` explicitly asks to verify). The model stays conservative about
+  *what* it claims; this only closes the gap where a justified claim was
+  previously left as prose with no code behind it.
 - **The recorder captures literal values.** Input/select values (passwords
   included) are recorded and used verbatim in the generated `fill()` calls. They
   are stored in `backend/data/` and never printed to the server log unless

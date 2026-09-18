@@ -202,6 +202,86 @@ section {
   color: #8c959f;
 }
 
+.hint {
+  color: #57606a;
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+
+.field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.field span {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #57606a;
+  margin-bottom: 4px;
+}
+
+.field input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.approve-steps {
+  margin: 0 0 12px;
+  padding-left: 18px;
+}
+
+.approve-steps li {
+  margin: 0 0 8px;
+}
+
+.approve-steps input {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.approve-steps .step-desc {
+  font-size: 12px;
+}
+
+.approve-steps .step-expected {
+  color: #57606a;
+}
+
+.code-input {
+  width: 100%;
+  min-height: 360px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 12px;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  font-family: "SF Mono", "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+#approve-btn {
+  border-color: #1a7f37;
+  background: #1f883d;
+  color: #fff;
+  font-weight: 600;
+  padding: 8px 16px;
+}
+
+#approve-btn:hover:not(:disabled) {
+  background: #1a7f37;
+}
+
 .log details {
   margin: 2px 0;
 }

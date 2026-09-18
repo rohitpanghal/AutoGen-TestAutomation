@@ -12,11 +12,11 @@ for (const dir of [RECORDINGS_DIR, TESTS_DIR]) {
   mkdirSync(dir, { recursive: true });
 }
 
-export function saveRecording(id: string, testName: string, actions: RecordedAction[]) {
+export function saveRecording(id: string, testName: string, actions: RecordedAction[], parentId?: string) {
   const file = path.join(RECORDINGS_DIR, `${id}.json`);
   writeFileSync(
     file,
-    JSON.stringify({ id, testName, actions, createdAt: new Date().toISOString() }, null, 2)
+    JSON.stringify({ id, testName, actions, parentId, createdAt: new Date().toISOString() }, null, 2)
   );
 }
 
@@ -49,16 +49,23 @@ export function loadGeneratedTest(id: string): GeneratedTestRecord | null {
   return JSON.parse(readFileSync(file, 'utf-8'));
 }
 
-// Overwrites both the on-disk spec file and the stored record with healed code.
-// The spec file is the same file the user already has open/committed — self-healing
-// edits it in place rather than creating a shadow copy, so `git diff` shows exactly
-// what the loop changed.
-export function updateGeneratedTest(id: string, playwrightCode: string) {
+// Overwrites the stored record (and, when the code changed, the on-disk spec
+// file) with QA/self-heal edits. The spec file is the same file the user
+// already has open/committed — edits land in place rather than a shadow copy,
+// so `git diff` shows exactly what changed. `testCase` alone (e.g. QA tweaking
+// a step's description) doesn't touch the spec file at all.
+export function updateGeneratedTest(id: string, updates: { playwrightCode?: string; testCase?: GeneratedTestCase }) {
   const record = loadGeneratedTest(id);
   if (!record) throw new Error(`No generated test found for id ${id}`);
-  writeFileSync(record.specFile, playwrightCode);
+  const merged: GeneratedTestRecord = {
+    ...record,
+    testCase: updates.testCase ?? record.testCase,
+    playwrightCode: updates.playwrightCode ?? record.playwrightCode,
+  };
+  if (updates.playwrightCode !== undefined) writeFileSync(record.specFile, updates.playwrightCode);
   const jsonFile = path.join(RECORDINGS_DIR, `${id}.result.json`);
-  writeFileSync(jsonFile, JSON.stringify({ ...record, playwrightCode }, null, 2));
+  writeFileSync(jsonFile, JSON.stringify(merged, null, 2));
+  return merged;
 }
 
 export function loadRecording(id: string) {

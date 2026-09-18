@@ -34,7 +34,7 @@ async function runHealJob(ctx: JobContext, input: HealJobInput) {
   });
 
   if (result.code !== record.playwrightCode) {
-    updateGeneratedTest(input.recordId, result.code);
+    updateGeneratedTest(input.recordId, { playwrightCode: result.code });
   }
 
   const done = {
