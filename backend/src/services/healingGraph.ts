@@ -1,8 +1,10 @@
-// Self-healing loop: run the generated spec, and if it fails, ask Claude to
-// diagnose + patch it, then run again — until it passes, a fix claims the
-// failure is a real app regression (retrying identical code would be pointless),
-// or maxAttempts is exhausted. LangGraph owns the run/fix/retry control flow;
-// the nodes themselves are thin wrappers around the existing runner + LLM call.
+// Self-healing loop: run the generated spec, and if it fails, hand off to one
+// continuous agentic fix session — the model edits the test, runs it for real,
+// reads the actual result, and keeps iterating (the same edit/run/observe loop
+// Claude Code itself uses) until it passes, it flags a real app regression, or
+// it exhausts maxAttempts. LangGraph owns the two-step shape (run once, then
+// fix); the fix session itself owns every retry after that, with one
+// continuous model conversation instead of a fresh, memoryless call per retry.
 //
 // Every attempt (including the first) runs off a scratch copy in the same
 // directory, never the real spec file the user has open — so the file on disk
@@ -14,7 +16,7 @@ import path from 'node:path';
 import { nanoid } from 'nanoid';
 import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
 import { runPlaywrightTest } from './testRunner.js';
-import { fixTest, extractFailingLocator, type FixResult } from './anthropic.js';
+import { runFixSession, extractFailingLocator, type FixSessionParams, type FixSessionResult, type BrowserFixSupport } from './anthropic.js';
 import { getSession, type BreakPoint, type HealingSession } from './healingBrowser.js';
 import type { GeneratedTestCase, RecordedAction } from '../types.js';
 import type { TestRunResult } from './testRunner.js';
@@ -51,8 +53,9 @@ function breakPhrase(brk: BreakPoint): string {
   return 'locator no longer resolves to exactly one element';
 }
 
-// Default number of run→fix→run cycles, and the ceiling a per-request override is
-// clamped to. Set MAX_HEAL_ATTEMPTS in the environment to change it.
+// Default number of fix attempts the agentic session gets after the first run,
+// and the ceiling a per-request override is clamped to. Set MAX_HEAL_ATTEMPTS
+// in the environment to change it.
 export const MAX_HEAL_ATTEMPTS = Math.max(1, Math.trunc(Number(process.env.MAX_HEAL_ATTEMPTS)) || 4);
 
 const HealState = Annotation.Root({
@@ -60,40 +63,40 @@ const HealState = Annotation.Root({
   code: Annotation<string>({ reducer: (_prev, next) => next, default: () => '' }),
   specFile: Annotation<string>({ reducer: (_prev, next) => next, default: () => '' }),
   scratchFile: Annotation<string>({ reducer: (_prev, next) => next, default: () => '' }),
-  attempt: Annotation<number>({ reducer: (_prev, next) => next, default: () => 0 }),
   maxAttempts: Annotation<number>({ reducer: (_prev, next) => next, default: () => MAX_HEAL_ATTEMPTS }),
   status: Annotation<'running' | 'passed' | 'failed'>({ reducer: (_prev, next) => next, default: () => 'running' }),
   lastOutput: Annotation<string>({ reducer: (_prev, next) => next, default: () => '' }),
   suspectedRealBug: Annotation<boolean>({ reducer: (_prev, next) => next, default: () => false }),
-  // The last fix returned code byte-identical to what just failed — retrying it
-  // would fail the same way, so stop instead of burning the remaining attempts.
-  stalled: Annotation<boolean>({ reducer: (_prev, next) => next, default: () => false }),
+  // How many additional runs (beyond the first) the fix session actually
+  // executed — the same thing `state.attempt` used to count via the outer loop.
+  attempt: Annotation<number>({ reducer: (_prev, next) => next, default: () => 0 }),
   history: Annotation<HealAttempt[]>({ reducer: (_prev, next) => next, default: () => [] }),
 });
 
 type HealStateType = typeof HealState.State;
 
-// Real Playwright execution and the LLM call are injected rather than imported
-// directly by the nodes, so the graph's control flow (run/fix/retry/stop) can be
-// exercised in tests without a browser or network access.
+// Real Playwright execution and the LLM fix session are injected rather than
+// imported directly by the nodes, so the graph's control flow (run/fix/stop)
+// can be exercised in tests without a browser or network access.
 export interface HealingGraphDeps {
   run: (specFile: string) => Promise<TestRunResult>;
-  fix: (testCase: GeneratedTestCase, code: string, failureOutput: string) => Promise<FixResult>;
+  fix: (params: Omit<FixSessionParams, 'browser' | 'signal'>) => Promise<FixSessionResult>;
 }
 
 function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = noopEvent) {
   async function runNode(state: HealStateType): Promise<Partial<HealStateType>> {
     onEvent({ type: 'heal:attempt-start', attempt: state.attempt + 1, maxAttempts: state.maxAttempts });
-    // Always run off the scratch copy, never the real specFile — fixNode only
-    // updates state.code in memory, and writing each attempt to the file the
-    // user has open would flicker/overwrite it on every iteration. The scratch
-    // file is what Playwright actually executes; the real file is untouched
-    // until the caller commits the final result once healing is done.
+    // Always run off the scratch copy, never the real specFile — the fix
+    // session only updates state.code in memory, and writing each attempt to
+    // the file the user has open would flicker/overwrite it on every
+    // iteration. The scratch file is what Playwright actually executes; the
+    // real file is untouched until the caller commits the final result once
+    // healing is done.
     writeFileSync(state.scratchFile, state.code);
-    console.log(`[heal] attempt ${state.attempt}/${state.maxAttempts} — running scratch copy ${state.scratchFile}...`);
+    console.log(`[heal] attempt ${state.attempt + 1} — running scratch copy ${state.scratchFile}...`);
     const start = Date.now();
     const result = await deps.run(state.scratchFile);
-    console.log(`[heal] attempt ${state.attempt}/${state.maxAttempts} — ${result.passed ? 'PASSED' : 'FAILED'} in ${Date.now() - start}ms`);
+    console.log(`[heal] attempt ${state.attempt + 1} — ${result.passed ? 'PASSED' : 'FAILED'} in ${Date.now() - start}ms`);
     onEvent({
       type: 'heal:run-result',
       attempt: state.attempt + 1,
@@ -103,7 +106,7 @@ function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = n
     return {
       lastOutput: result.output,
       status: result.passed ? 'passed' : 'failed',
-      history: [...state.history, { attempt: state.attempt, passed: result.passed, output: result.output }],
+      history: [...state.history, { attempt: state.attempt + 1, passed: result.passed, output: result.output }],
     };
   }
 
@@ -112,48 +115,43 @@ function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = n
       console.log(`[heal] test passes — done`);
       return END;
     }
-    if (state.attempt >= state.maxAttempts) {
-      console.log(`[heal] max attempts (${state.maxAttempts}) reached — giving up`);
+    if (state.maxAttempts <= 0) {
+      console.log(`[heal] no fix attempts configured — giving up`);
       return END;
     }
     return 'fix';
   }
 
+  // One agentic session owns every retry from here: it runs its own
+  // candidates, reads the real output, and decides for itself when to stop.
   async function fixNode(state: HealStateType): Promise<Partial<HealStateType>> {
-    console.log(`[heal] attempt ${state.attempt}/${state.maxAttempts} — asking Claude to diagnose and patch the failure...`);
-    const start = Date.now();
-    const result = await deps.fix(state.testCase, state.code, state.lastOutput);
-    console.log(`[heal] fix received in ${Date.now() - start}ms — likelyRealBug=${result.likelyRealBug}`);
-    onEvent({
-      type: 'heal:diagnosis',
-      attempt: state.attempt + 1,
-      diagnosis: result.diagnosis,
-      likelyRealBug: result.likelyRealBug,
-    });
-    const history = state.history.slice();
-    if (history.length > 0) {
-      history[history.length - 1] = { ...history[history.length - 1], diagnosis: result.diagnosis };
-    }
-    const stalled = result.updatedPlaywrightCode.trim() === state.code.trim();
-    return {
-      code: result.updatedPlaywrightCode,
-      attempt: state.attempt + 1,
-      suspectedRealBug: result.likelyRealBug,
-      stalled,
-      history,
+    const runCandidate = async (code: string): Promise<TestRunResult> => {
+      writeFileSync(state.scratchFile, code);
+      return deps.run(state.scratchFile);
     };
-  }
-
-  function routeAfterFix(state: HealStateType): 'run' | typeof END {
-    if (state.suspectedRealBug) {
-      console.log(`[heal] fix flagged as a likely real app bug — stopping without retrying`);
-      return END;
-    }
-    if (state.stalled) {
-      console.log(`[heal] fix returned unchanged code — no progress, stopping`);
-      return END;
-    }
-    return 'run';
+    console.log(`[heal] handing off to the fix session — up to ${state.maxAttempts} more attempt(s)`);
+    const session = await deps.fix({
+      testCase: state.testCase,
+      code: state.code,
+      failureOutput: state.lastOutput,
+      maxFixAttempts: state.maxAttempts,
+      lastAttemptNumber: state.attempt + 1,
+      runCandidate,
+      onAttemptStart: (attempt) => onEvent({ type: 'heal:attempt-start', attempt, maxAttempts: state.maxAttempts }),
+      onRunResult: (attempt, passed, output) =>
+        onEvent({ type: 'heal:run-result', attempt, passed, outputTail: output.slice(-OUTPUT_TAIL_CHARS) }),
+      onDiagnosis: (attempt, diagnosis, likelyRealBug) => onEvent({ type: 'heal:diagnosis', attempt, diagnosis, likelyRealBug }),
+      onBrowserMessage: (message) => onEvent({ type: 'heal:browser', message }),
+    });
+    console.log(`[heal] fix session ended — status=${session.status}, likelyRealBug=${session.likelyRealBug}, runs=${session.history.length}`);
+    return {
+      code: session.code,
+      status: session.status,
+      suspectedRealBug: session.likelyRealBug,
+      lastOutput: session.history.length ? session.history[session.history.length - 1].output : state.lastOutput,
+      attempt: state.attempt + session.history.length,
+      history: [...state.history, ...session.history],
+    };
   }
 
   return new StateGraph(HealState)
@@ -161,7 +159,7 @@ function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = n
     .addNode('fix', fixNode)
     .addEdge(START, 'run')
     .addConditionalEdges('run', routeAfterRun)
-    .addConditionalEdges('fix', routeAfterFix)
+    .addEdge('fix', END)
     .compile();
 }
 
@@ -216,7 +214,7 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
   let session: HealingSession | undefined;
   let deps: HealingGraphDeps = depsOverride ?? {
     run: (specFile) => runPlaywrightTest(specFile, signal),
-    fix: (testCase, code, failureOutput) => fixTest(testCase, code, failureOutput, undefined, signal),
+    fix: (params) => runFixSession({ ...params, signal }),
   };
   if (!depsOverride && input.recordedActions?.length) {
     session = await getSession();
@@ -235,9 +233,18 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
     console.log(`[heal] ${parkedMsg(brk, breakSummary)}`);
     onEvent({ type: 'heal:browser', message: parkedMsg(brk, breakSummary) });
     const boundSession = session;
-    deps = {
-      run: (specFile) => runPlaywrightTest(specFile, signal),
-      fix: async (testCase, code, failureOutput) => {
+
+    // Bridges the recording-replay domain (brk / workingActions) into the
+    // agentic fix session: re-parks the live browser when a later attempt's
+    // failure has moved to a different step, and bakes each verified locator
+    // back into the working recording so a future re-replay reflects it.
+    const browserSupport: BrowserFixSupport = {
+      session: boundSession,
+      actionIndex: brk.actionIndex,
+      brokenAction: brk.brokenAction,
+      brokenLocatorExpr: brk.brokenLocatorExpr,
+      breakSummary,
+      resync: async (failureOutput: string) => {
         // The live browser stays parked wherever the FIRST replay left it —
         // if an earlier attempt's fix resolved that step and the real test
         // (run via runPlaywrightTest, not this simplified replay) now fails
@@ -247,38 +254,29 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
         // (a locator actually extracted from THIS run's failure, and it
         // doesn't match where we're parked) — never guess.
         const nowFailing = extractFailingLocator(failureOutput);
-        if (nowFailing && nowFailing !== brk.brokenLocatorExpr) {
-          const msg = 'Failure moved to a different step — re-syncing the live browser…';
-          console.log(`[heal] ${msg} (was: ${brk.brokenLocatorExpr ?? '(none)'}, now: ${nowFailing})`);
-          onEvent({ type: 'heal:browser', message: msg });
-          brk = await boundSession.replayUntilBroken(workingActions);
-          breakSummary = breakPhrase(brk);
-          console.log(`[heal] ${parkedMsg(brk, breakSummary)}`);
-          onEvent({ type: 'heal:browser', message: parkedMsg(brk, breakSummary) });
-        }
-        const result = await fixTest(
-          testCase,
-          code,
-          failureOutput,
-          {
-            session: boundSession,
-            brokenAction: brk.brokenAction,
-            brokenLocatorExpr: brk.brokenLocatorExpr,
-            actionIndex: brk.actionIndex,
-            breakSummary,
-          },
-          signal
-        );
+        if (!nowFailing || nowFailing === brk.brokenLocatorExpr) return null;
+        console.log(`[heal] failure moved — re-syncing the live browser (was: ${brk.brokenLocatorExpr ?? '(none)'}, now: ${nowFailing})`);
+        brk = await boundSession.replayUntilBroken(workingActions);
+        breakSummary = breakPhrase(brk);
+        const msg = `Failure moved to a different step — re-syncing the live browser… ${parkedMsg(brk, breakSummary)}`;
+        console.log(`[heal] ${parkedMsg(brk, breakSummary)}`);
+        return { message: msg, actionIndex: brk.actionIndex, brokenAction: brk.brokenAction, brokenLocatorExpr: brk.brokenLocatorExpr, breakSummary };
+      },
+      onVerifiedLocator: (locatorExpr, actionIndex) => {
         // Bake this fix into the working copy so a FUTURE re-replay (above)
         // reflects it instead of re-discovering the same original break.
-        if (result.verifiedLocator && !result.likelyRealBug && brk.actionIndex < workingActions.length) {
-          const action = workingActions[brk.actionIndex];
+        if (actionIndex < workingActions.length) {
+          const action = workingActions[actionIndex];
           if (action.element) {
-            workingActions[brk.actionIndex] = { ...action, element: { ...action.element, suggestedLocator: result.verifiedLocator } };
+            workingActions[actionIndex] = { ...action, element: { ...action.element, suggestedLocator: locatorExpr } };
           }
         }
-        return result;
       },
+    };
+
+    deps = {
+      run: (specFile) => runPlaywrightTest(specFile, signal),
+      fix: (params) => runFixSession({ ...params, signal, browser: browserSupport }),
     };
   }
 
@@ -290,12 +288,11 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
       code: input.code,
       specFile: input.specFile,
       scratchFile,
-      attempt: 0,
-      maxAttempts: input.maxAttempts ?? MAX_HEAL_ATTEMPTS,
+      maxAttempts: Math.max(0, Math.trunc(input.maxAttempts ?? MAX_HEAL_ATTEMPTS)),
       status: 'running',
       lastOutput: '',
       suspectedRealBug: false,
-      stalled: false,
+      attempt: 0,
       history: [],
     });
     return finalState;
