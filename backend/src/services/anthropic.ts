@@ -39,7 +39,7 @@ Selectors — each action's element includes a precomputed "suggestedLocator": a
 Frames — an element captured inside an iframe carries an "element.frame" object. When suggestedLocator is present, it already includes the necessary "page.frameLocator('…').frameLocator('…')…" chain (same-origin iframe, computed and verified the same deterministic way as every other suggestedLocator) — use it verbatim like any other. When "element.frame.crossOrigin" is true, suggestedLocator is deliberately absent — the recorder cannot reach into a cross-origin frame to compute or verify a selector for it, so nothing here is a fact you can trust. In that case, build "page.frameLocator(<best-effort selector>)" yourself from "element.frame.frameUrl" (e.g. an iframe[src*="…"] guess using a distinctive part of that URL) chained with a leaf derived from the raw element fields (role/text/label per the priority order above), explicitly state in that step's description that the frame locator is unverified because the frame is cross-origin, and do not add an expectedResult for that step — you cannot justify a claim you cannot verify.
 
 Waiting — never use page.waitForTimeout or any arbitrary sleep. Playwright locators auto-wait for actionability, so a normal "await page.getByRole(...).click()" already waits for the element. The one case that needs an explicit wait is an action immediately followed by a "navigate" action in the recording — that action caused a navigation (a full page load AND an SPA route change are both recorded as "navigate"). After THAT specific action, and only that one, add "await page.waitForURL('**' + pathname)" using the path of the navigate action's url (leading "**" then the pathname, e.g. "**/bookappointments"), before interacting with anything on the new page.
-Placement is strict: tie the wait to the action the "navigate" immediately follows — NOT to whichever click "looks like" the navigating one (a login / submit / "Proceed" button), and NOT just because that url appears somewhere else in the recording. Cross-check with the "url" field: every action carries the url of the page it happened on. If action N and action N+1 share the same "url" and no "navigate" sits between them, nothing navigated there — no wait. If their "url" values differ (even with no "navigate" action recorded between them, e.g. an older recording), treat action N as having navigated to N+1's url and add the waitForURL after N. For an async UI change that did NOT change the url and produced no "navigate" action (a modal opening, an inline panel swap), do not add a manual wait — let the next locator's auto-wait handle it; use "await expect(locator).toBeVisible()" only where the test is specifically asserting that something appeared.
+Placement is strict: tie the wait to the action the "navigate" immediately follows — NOT to whichever click "looks like" the navigating one (a login / submit / "Proceed" button), and NOT just because that url appears somewhere else in the recording. Cross-check with the "url" field: every action carries the url of the page it happened on. If action N and action N+1 share the same "url" and no "navigate" sits between them, nothing navigated there — no wait. If their "url" values differ (even with no "navigate" action recorded between them, e.g. an older recording), treat action N as having navigated to N+1's url and add the waitForURL after N. A recorded "navigate" action does NOT always mean the pathname actually changed — some SPAs call history.replaceState (or otherwise fire a navigation event) without changing the path, purely to trigger a re-render off client-side state. Check the navigate action's own "url" against the surrounding actions' "url": if it's the SAME pathname (not just the same origin), page.waitForURL would wait for a condition that's already true or never becomes newly true — do not emit it; instead treat this exactly like an async UI change with no url change (below). For an async UI change that did NOT change the url and produced no "navigate" action (a modal opening, an inline panel swap, or the same-pathname "navigate" case above), do not add a manual wait — let the next locator's auto-wait handle it; use "await expect(locator).toBeVisible()" only where the test is specifically asserting that something appeared.
 One targeted exception for form submits: when a single click submits a form that the immediately preceding steps filled (a Save / Submit / Create button right after a run of fill / selectOption calls), the app often re-renders that button on each field commit and can detach it mid-click. For THAT click only, emit: first "await page.locator('input[name=\"…\"]').blur()" on the last field the test filled (commit its onChange re-render before the click), then issue the click through a re-resolving retry — "await expect(async () => { await <buttonLocator>.click({ timeout: 5000 }); }).toPass({ timeout: 30000 });". Do not wrap ordinary mid-flow clicks this way; only the form-submitting one.
 
 Values — every "input"/"select" action's "value" field is the real, literal value that was recorded (recording no longer masks anything). Use it verbatim in the generated fill/selectOption call. Never invent, guess, or paraphrase a value that isn't present in the recorded actions.
@@ -146,7 +146,7 @@ const WAIT_RETRY_GUIDANCE = `Diagnosed strategy: WAIT/RETRY REPAIR — the locat
 
 Do not fix a failure by raising a timeout or retry budget more than once in a row. A single timeout increase can be a legitimate first hypothesis, but if that still fails, the problem is not "not enough time" — go find out what's actually happening (why the element isn't appearing/enabling, what state the app is really in) instead of raising the same number again; a second consecutive timing-only edit is rejected automatically.`;
 
-const NAVIGATION_REPAIR_GUIDANCE = `Diagnosed strategy: NAVIGATION REPAIR — the failure is a URL/page-load expectation not met. Likely cause: a missing wait after an action that triggers navigation — add page.waitForURL(...) using the pathname of the page the recording navigated to right after that action, never a fixed sleep.`;
+const NAVIGATION_REPAIR_GUIDANCE = `Diagnosed strategy: NAVIGATION REPAIR — the failure is a URL/page-load expectation not met. Do not assume the fix is page.waitForURL(...) — verify first whether the pathname genuinely changes for this transition (check the failure output for the actual URL before/after, or probe the live page's current URL if you have browser tools). Some SPAs render a new screen purely off client-side state (an auth flag, a redux/context value) with no pushState/hashchange/document load at all, or call history.replaceState with a URL that doesn't actually differ — for those, page.waitForURL will simply never resolve because the condition it's waiting for was already true, or never becomes true at all. If the URL genuinely changes: add page.waitForURL(...) using the real pathname, never a fixed sleep. If it does NOT change: remove/avoid waitForURL entirely and instead wait on the next step's own target locator with await expect(locator).toBeVisible({ timeout: 20000 }) (or a longer timeout if the app is slow to settle) — that visibility change, not the URL, is the true signal the transition completed.`;
 
 // Applies regardless of which strategy above is active.
 const GENERAL_GUIDANCE = `If the failure output shows the application genuinely did something different from what the recording expected (not a selector, wait/retry, or navigation problem) — a card renamed or removed, a label reworded, a different page reached — that is not a test bug, it's a real regression: call emit_fix with likelyRealBug true and explain what changed in the diagnosis.
@@ -279,6 +279,10 @@ export interface FixSessionResult {
   diagnosis: string;
   likelyRealBug: boolean;
   history: FixHistoryEntry[];
+  // Evidence captured at the moment a real-bug verdict was reached (live
+  // browser only) — so a human reviewing a recurring case later has more
+  // than just text to go on.
+  screenshotPath?: string;
 }
 
 export interface BrowserFixSupport {
@@ -323,6 +327,11 @@ export interface FixSessionParams {
   onStrategy?: (attempt: number, strategy: RepairStrategy, reason: 'initial' | 're-diagnosed' | 'escalated') => void;
   browser?: BrowserFixSupport;
   signal?: AbortSignal;
+  // Set only on a guided re-heal triggered from the human review panel for a
+  // recurring likelyRealBug case — a human-authored correction, injected as
+  // authoritative context (buildInitialUserContent) the same way a recorded
+  // step's own description already overrides inference.
+  humanHint?: string;
 }
 
 // Lives in failureClassifier.ts (pure, no SDK import); re-exported so existing
@@ -341,14 +350,20 @@ function consoleNetworkBlock(session: HealingSession): string {
   return `\n\nLive browser activity since the session started:${consolePart}${networkPart}`;
 }
 
+function humanHintBlock(humanHint: string | undefined): string {
+  if (!humanHint) return '';
+  return `\n\nA human reviewed this recurring failure and provided this correction — AUTHORITATIVE, overrides the invariant against retargeting a quoted literal for this run:\n${humanHint}`;
+}
+
 function buildInitialUserContent(
   testCase: GeneratedTestCase,
   code: string,
   failureOutput: string,
-  browser?: BrowserFixSupport
+  browser?: BrowserFixSupport,
+  humanHint?: string
 ): string {
   if (!browser) {
-    return `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}`;
+    return `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}${humanHintBlock(humanHint)}`;
   }
   const intentLine = browser.brokenAction?.description
     ? `\n\nUser intent for that step (authoritative — every quoted string in it is a value you may NOT change):\n${browser.brokenAction.description}`
@@ -360,7 +375,7 @@ function buildInitialUserContent(
   const brokenContext = browser.brokenLocatorExpr
     ? `\n\nThe live browser was replayed to recorded action #${browser.actionIndex} (${browser.brokenAction?.action}). Parking reason: ${browser.breakSummary}.\nParked-step locator:\n${browser.brokenLocatorExpr}${intentLine}${authoritativeNote}\n\nRecorded element descriptor for that action:\n${JSON.stringify(browser.brokenAction?.element ?? {}, null, 2)}`
     : `\n\nThe replay reached recorded action #${browser.actionIndex} without a locator breaking; the failure is likely an assertion or timing issue at or after that point. The live browser is parked there.${intentLine}${authoritativeNote}`;
-  return `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}${brokenContext}${consoleNetworkBlock(browser.session)}`;
+  return `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}${brokenContext}${consoleNetworkBlock(browser.session)}${humanHintBlock(humanHint)}`;
 }
 
 async function runBrowserProbeTool(
@@ -437,7 +452,7 @@ const TURNS_PER_ATTEMPT_BUDGET = 8;
 // cycle with no memory of earlier attempts. It stops itself once a run passes,
 // calls emit_fix for a genuine app regression, or exhausts maxFixAttempts.
 export async function runFixSession(params: FixSessionParams): Promise<FixSessionResult> {
-  const { testCase, code: initialCode, failureOutput: initialFailure, maxFixAttempts, runCandidate, browser, signal } = params;
+  const { testCase, code: initialCode, failureOutput: initialFailure, maxFixAttempts, runCandidate, browser, signal, humanHint } = params;
   const { onAttemptStart, onRunResult, onDiagnosis } = params;
   const onBrowserMessage = params.onBrowserMessage ?? (() => {});
   const onStrategy = params.onStrategy ?? (() => {});
@@ -465,7 +480,7 @@ export async function runFixSession(params: FixSessionParams): Promise<FixSessio
   let systemPrompt = buildFixSystemPrompt(!!browser, currentStrategy);
   const tools = (browser ? [RUN_CANDIDATE_TOOL, EMIT_FIX_TOOL, ...BROWSER_PROBE_TOOLS] : [RUN_CANDIDATE_TOOL, EMIT_FIX_TOOL]) as unknown as Anthropic.Tool[];
   const messages: Anthropic.MessageParam[] = [
-    { role: 'user', content: buildInitialUserContent(testCase, initialCode, initialFailure, browser) },
+    { role: 'user', content: buildInitialUserContent(testCase, initialCode, initialFailure, browser, humanHint) },
   ];
   const trail: string[] = [];
   const history: FixHistoryEntry[] = [];
@@ -645,12 +660,17 @@ export async function runFixSession(params: FixSessionParams): Promise<FixSessio
         const { diagnosis, likelyRealBug } = t.input as { diagnosis: string; likelyRealBug: boolean };
         onDiagnosis(lastAttemptNumber, diagnosis, Boolean(likelyRealBug));
         console.log(`[anthropic] fix session stopped via emit_fix — likelyRealBug=${Boolean(likelyRealBug)}`);
+        // Evidence for a later human review, if this recurs — cheap to grab
+        // now, and we don't know yet whether it'll turn out to be a repeat.
+        const screenshotPath =
+          likelyRealBug && browser ? await browser.session.screenshot('real-bug').catch(() => undefined) : undefined;
         finished = {
           status: 'failed',
           code: likelyRealBug ? initialCode : lastFailedCode,
           diagnosis,
           likelyRealBug: Boolean(likelyRealBug),
           history,
+          screenshotPath,
         };
         break;
       }

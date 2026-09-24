@@ -20,6 +20,7 @@ import { runFixSession, extractFailingLocator, type FixSessionParams, type FixSe
 import { getSession, type BreakPoint, type HealingSession } from './healingBrowser.js';
 import { classifyFailure, type FailureSignature } from './failureClassifier.js';
 import { appendRecovery, diffLines } from './recoveryStore.js';
+import { recordOccurrence, type ReviewStatus } from './reviewStore.js';
 import type { RepairStrategy } from './healingStrategy.js';
 import type { GeneratedTestCase, RecordedAction } from '../types.js';
 import type { TestRunResult } from './testRunner.js';
@@ -44,7 +45,11 @@ export type HealEvent =
   | { type: 'heal:strategy'; attempt: number; strategy: RepairStrategy; reason: 'initial' | 're-diagnosed' | 'escalated' }
   // Emitted once per heal session that started from a failing run, after the
   // outcome has been appended to the recovery store.
-  | { type: 'heal:recorded'; recoveryId: string; signature: FailureSignature };
+  | { type: 'heal:recorded'; recoveryId: string; signature: FailureSignature }
+  // Only fires for a RECURRING likelyRealBug verdict (2nd+ occurrence of the
+  // same underlying failure, and not already human-decided) — a single
+  // flagged run never triggers this. The signal that a human should look.
+  | { type: 'heal:review'; caseId: string; occurrences: number; status: ReviewStatus };
 
 const OUTPUT_TAIL_CHARS = 2000;
 const noopEvent = (_ev: HealEvent): void => {};
@@ -77,6 +82,11 @@ const HealState = Annotation.Root({
   status: Annotation<'running' | 'passed' | 'failed'>({ reducer: (_prev, next) => next, default: () => 'running' }),
   lastOutput: Annotation<string>({ reducer: (_prev, next) => next, default: () => '' }),
   suspectedRealBug: Annotation<boolean>({ reducer: (_prev, next) => next, default: () => false }),
+  // The fix session's own explanation for the final outcome, and (real-bug
+  // only) a screenshot captured at the moment it gave up — both flow into the
+  // review case when this recurs.
+  lastDiagnosis: Annotation<string>({ reducer: (_prev, next) => next, default: () => '' }),
+  screenshotPath: Annotation<string | undefined>({ reducer: (_prev, next) => next, default: () => undefined }),
   // How many additional runs (beyond the first) the fix session actually
   // executed — the same thing `state.attempt` used to count via the outer loop.
   attempt: Annotation<number>({ reducer: (_prev, next) => next, default: () => 0 }),
@@ -93,7 +103,7 @@ export interface HealingGraphDeps {
   fix: (params: Omit<FixSessionParams, 'browser' | 'signal'>) => Promise<FixSessionResult>;
 }
 
-function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = noopEvent) {
+function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = noopEvent, humanHint?: string) {
   async function runNode(state: HealStateType): Promise<Partial<HealStateType>> {
     // Displayed denominator is the total run budget (this initial run plus
     // every fix attempt), not just state.maxAttempts (the fix budget alone) —
@@ -156,12 +166,15 @@ function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = n
       onDiagnosis: (attempt, diagnosis, likelyRealBug) => onEvent({ type: 'heal:diagnosis', attempt, diagnosis, likelyRealBug }),
       onBrowserMessage: (message) => onEvent({ type: 'heal:browser', message }),
       onStrategy: (attempt, strategy, reason) => onEvent({ type: 'heal:strategy', attempt, strategy, reason }),
+      humanHint,
     });
     console.log(`[heal] fix session ended — status=${session.status}, likelyRealBug=${session.likelyRealBug}, runs=${session.history.length}`);
     return {
       code: session.code,
       status: session.status,
       suspectedRealBug: session.likelyRealBug,
+      lastDiagnosis: session.diagnosis,
+      screenshotPath: session.screenshotPath,
       lastOutput: session.history.length ? session.history[session.history.length - 1].output : state.lastOutput,
       attempt: state.attempt + session.history.length,
       history: [...state.history, ...session.history],
@@ -189,6 +202,9 @@ export interface HealInput {
   // hands the fixer live-DOM verification tools. Omit it (or pass `deps`) to run
   // the old text-only loop.
   recordedActions?: RecordedAction[];
+  // Set only on a guided re-heal triggered from the human review panel for a
+  // recurring likelyRealBug case — see anthropic.ts's FixSessionParams.
+  humanHint?: string;
   // Progress callback — the job runner forwards these onto the SSE stream.
   onEvent?: (ev: HealEvent) => void;
   // Cancellation: aborts the in-flight Playwright run and LLM call, and stops the
@@ -226,21 +242,43 @@ function recordRecovery(
     const signature = classifyFailure(first.output, firstBreak);
     const { removedLines, addedLines } = diffLines(input.code, state.code);
     const recoveryId = nanoid(10);
+    const outcome = state.status === 'passed' ? 'passed' : state.suspectedRealBug ? 'real-bug' : 'failed';
     appendRecovery({
       id: recoveryId,
       createdAt: new Date().toISOString(),
       testId: input.testId,
       testTitle: input.testCase.title,
       signature,
-      outcome: state.status === 'passed' ? 'passed' : state.suspectedRealBug ? 'real-bug' : 'failed',
+      outcome,
       attempts: state.history.length,
       removedLines,
       addedLines,
       strategy: null,
       usedLiveBrowser: Boolean(firstBreak),
+      diagnosis: state.lastDiagnosis || undefined,
+      screenshotPath: state.screenshotPath,
     });
     console.log(`[heal] recorded recovery ${recoveryId} — ${signature.kind}, outcome=${state.status}`);
     onEvent({ type: 'heal:recorded', recoveryId, signature });
+
+    // Human-in-the-loop gate: a single real-bug verdict is just a hypothesis
+    // and stays silent (recorded above, nothing more). Only a RECURRING one —
+    // the same underlying failure flagged real-bug before — actually surfaces
+    // for review.
+    if (outcome === 'real-bug') {
+      const { reviewCase, shouldNotify } = recordOccurrence({
+        signature,
+        recoveryId,
+        testId: input.testId,
+        testTitle: input.testCase.title,
+        diagnosis: state.lastDiagnosis,
+        screenshotPath: state.screenshotPath,
+      });
+      if (shouldNotify) {
+        console.log(`[heal] review case ${reviewCase.id} flagged — ${reviewCase.occurrences} occurrences`);
+        onEvent({ type: 'heal:review', caseId: reviewCase.id, occurrences: reviewCase.occurrences, status: reviewCase.status });
+      }
+    }
   } catch (err) {
     console.warn(`[heal] could not record recovery: ${(err as Error).message}`);
   }
@@ -334,7 +372,7 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
     };
   }
 
-  const graph = buildGraph(deps, onEvent);
+  const graph = buildGraph(deps, onEvent, input.humanHint);
   let finalState: HealStateType | undefined;
   try {
     finalState = await graph.invoke({
@@ -346,6 +384,8 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
       status: 'running',
       lastOutput: '',
       suspectedRealBug: false,
+      lastDiagnosis: '',
+      screenshotPath: undefined,
       attempt: 0,
       history: [],
     });

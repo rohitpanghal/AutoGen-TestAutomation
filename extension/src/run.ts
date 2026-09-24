@@ -26,6 +26,14 @@ const codeSection = $<HTMLElement>('code-section');
 const codeEl = $<HTMLPreElement>('code');
 const diagnosesSection = $<HTMLElement>('diagnoses-section');
 const diagnosesEl = $<HTMLOListElement>('diagnoses');
+const reviewSection = $<HTMLElement>('review-section');
+const reviewStatusEl = $<HTMLParagraphElement>('review-status');
+const reviewDiagnosisEl = $<HTMLParagraphElement>('review-diagnosis');
+const reviewScreenshotEl = $<HTMLImageElement>('review-screenshot');
+const reviewConfirmBtn = $<HTMLButtonElement>('review-confirm-btn');
+const reviewDismissBtn = $<HTMLButtonElement>('review-dismiss-btn');
+const reviewHintInput = $<HTMLInputElement>('review-hint-input');
+const reviewHintBtn = $<HTMLButtonElement>('review-hint-btn');
 const logEl = $<HTMLDivElement>('log');
 
 const copyBtn = $<HTMLButtonElement>('copy-btn');
@@ -235,6 +243,49 @@ approveBtn.addEventListener('click', async () => {
   }
 });
 
+type ReviewCasePayload = {
+  id: string;
+  occurrences: number;
+  diagnosis: string;
+  screenshotUrl?: string;
+};
+
+// Set only while a review case is shown — the id the 3 action buttons act
+// against. Cleared implicitly by navigating away (the page reloads on any
+// action's success, same as Re-heal).
+let activeReviewCaseId = '';
+
+reviewScreenshotEl.onerror = () => reviewScreenshotEl.classList.add('hidden');
+
+// Fetches the case's own record for the diagnosis text + screenshot (the
+// 'heal:review' event itself only carries id/occurrences/status) rather than
+// relying on timing against other SSE events already logged on this page.
+async function renderReviewPanel(caseId: string, occurrences: number) {
+  activeReviewCaseId = caseId;
+  reviewStatusEl.textContent = `Flagged ${occurrences} times as a real app issue — not something the healer can resolve by itself.`;
+  reviewDiagnosisEl.textContent = '';
+  reviewScreenshotEl.classList.add('hidden');
+  reviewHintInput.value = '';
+  reviewConfirmBtn.disabled = false;
+  reviewDismissBtn.disabled = false;
+  reviewHintBtn.disabled = false;
+  show(reviewSection);
+  try {
+    const res = await fetch(`${API_BASE}/api/review`);
+    if (!res.ok) return;
+    const cases = (await res.json()) as ReviewCasePayload[];
+    const found = cases.find((c) => c.id === caseId);
+    if (!found) return;
+    reviewDiagnosisEl.textContent = found.diagnosis;
+    if (found.screenshotUrl) {
+      reviewScreenshotEl.src = `${API_BASE}${found.screenshotUrl}`;
+      reviewScreenshotEl.classList.remove('hidden');
+    }
+  } catch {
+    /* panel is still usable without the extra detail */
+  }
+}
+
 function addDiagnosis(attempt: number, text: string, realBug: boolean) {
   const li = document.createElement('li');
   li.textContent = `Attempt ${attempt}: ${text}`;
@@ -354,6 +405,12 @@ function attach(id: string) {
     else logLine(`Attempt ${d.attempt}: escalating — repeated ${label} failure, checking past fixes…`);
   });
 
+  source.addEventListener('heal:review', (e) => {
+    const d = JSON.parse((e as MessageEvent).data) as { caseId: string; occurrences: number; status: string };
+    logLine(`This failure has now been flagged as a real app issue ${d.occurrences} times — needs human review.`);
+    void renderReviewPanel(d.caseId, d.occurrences);
+  });
+
   source.addEventListener('done', (e) => {
     const d = JSON.parse((e as MessageEvent).data) as DonePayload;
     receivedAny = true;
@@ -442,6 +499,61 @@ rehealBtn.addEventListener('click', async () => {
     rehealBtn.disabled = false;
     alertEl.textContent = `Could not start re-heal: ${err instanceof Error ? err.message : String(err)}`;
     show(alertEl);
+  }
+});
+
+function setReviewButtonsDisabled(disabled: boolean) {
+  reviewConfirmBtn.disabled = disabled;
+  reviewDismissBtn.disabled = disabled;
+  reviewHintBtn.disabled = disabled;
+}
+
+reviewConfirmBtn.addEventListener('click', async () => {
+  if (!activeReviewCaseId) return;
+  setReviewButtonsDisabled(true);
+  try {
+    const res = await fetch(`${API_BASE}/api/review/${activeReviewCaseId}/confirm`, { method: 'POST' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    reviewStatusEl.textContent = 'Confirmed as a real app bug.';
+  } catch (err) {
+    reviewStatusEl.textContent = `Could not confirm: ${err instanceof Error ? err.message : String(err)}`;
+    setReviewButtonsDisabled(false);
+  }
+});
+
+reviewDismissBtn.addEventListener('click', async () => {
+  if (!activeReviewCaseId) return;
+  setReviewButtonsDisabled(true);
+  try {
+    const res = await fetch(`${API_BASE}/api/review/${activeReviewCaseId}/dismiss`, { method: 'POST' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    reviewStatusEl.textContent = 'Dismissed.';
+  } catch (err) {
+    reviewStatusEl.textContent = `Could not dismiss: ${err instanceof Error ? err.message : String(err)}`;
+    setReviewButtonsDisabled(false);
+  }
+});
+
+reviewHintBtn.addEventListener('click', async () => {
+  if (!activeReviewCaseId) return;
+  const hint = reviewHintInput.value.trim();
+  if (!hint) {
+    reviewStatusEl.textContent = 'Type a correction first.';
+    return;
+  }
+  setReviewButtonsDisabled(true);
+  try {
+    const res = await fetch(`${API_BASE}/api/review/${activeReviewCaseId}/hint`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hint }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { id } = (await res.json()) as { id: string };
+    location.search = `?id=${id}`; // reload fresh against the guided re-heal job, same as Re-heal
+  } catch (err) {
+    reviewStatusEl.textContent = `Could not start guided re-heal: ${err instanceof Error ? err.message : String(err)}`;
+    setReviewButtonsDisabled(false);
   }
 });
 

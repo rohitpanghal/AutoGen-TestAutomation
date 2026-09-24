@@ -29,6 +29,12 @@ export interface RecoveryRecord {
   strategy: string | null;
   // Whether a live-browser replay informed this heal.
   usedLiveBrowser: boolean;
+  // The model's own explanation for the final outcome — most useful when
+  // outcome is 'real-bug', where it's what a human review case shows.
+  diagnosis?: string;
+  // Screenshot captured at the moment a real-bug verdict was reached (live
+  // browser only).
+  screenshotPath?: string;
 }
 
 export function appendRecovery(record: RecoveryRecord): void {

@@ -64,6 +64,24 @@
         <ol id="diagnoses"></ol>
       </section>
 
+      <section id="review-section" class="hidden">
+        <h2>Needs review — recurring app issue</h2>
+        <p id="review-status" class="hint"></p>
+        <p id="review-diagnosis"></p>
+        <img id="review-screenshot" class="review-screenshot hidden" alt="Screenshot at point of failure" />
+        <div class="toolbar">
+          <button id="review-confirm-btn">Confirm real bug</button>
+          <button id="review-dismiss-btn">Dismiss</button>
+        </div>
+        <label class="field">
+          <span>Correction hint (e.g. "it's now called Ace Hardware LLC")</span>
+          <input id="review-hint-input" type="text" placeholder="Tell the healer what actually changed" />
+        </label>
+        <div class="toolbar">
+          <button id="review-hint-btn">Send hint &amp; re-heal</button>
+        </div>
+      </section>
+
       <section id="log-section">
         <h2>Progress</h2>
         <div id="log" class="log"></div>

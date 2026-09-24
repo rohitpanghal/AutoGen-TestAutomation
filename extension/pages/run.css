@@ -230,6 +230,14 @@ section {
   font-size: 13px;
 }
 
+.review-screenshot {
+  display: block;
+  max-width: 100%;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  margin: 0 0 12px;
+}
+
 .approve-steps {
   margin: 0 0 12px;
   padding-left: 18px;
