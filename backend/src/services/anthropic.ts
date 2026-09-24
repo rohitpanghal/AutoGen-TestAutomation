@@ -3,8 +3,12 @@
 import { readFileSync } from 'node:fs';
 import Anthropic from '@anthropic-ai/sdk';
 import type { RecordedAction, GeneratedTestCase } from '../types.js';
-import type { HealingSession } from './healingBrowser.js';
+import type { HealingSession, BreakPoint } from './healingBrowser.js';
 import { debugBlock } from './logging.js';
+import { classifyFailure, extractFailingLocator, type FailureSignature } from './failureClassifier.js';
+import { validateSpecCode } from './scriptValidator.js';
+import { selectStrategy, type RepairStrategy } from './healingStrategy.js';
+import { findSimilarRecoveries } from './recoveryStore.js';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -130,20 +134,50 @@ export async function generateTest(
   return output;
 }
 
-const FIX_GUIDANCE = `You are debugging a failing Playwright test that was auto-generated from a recorded user flow. You are given the original test case description, the current test code, and the Playwright failure output (error message, stack trace, strict-mode violation details, etc).
+const FIX_INTRO = `You are debugging a failing Playwright test that was auto-generated from a recorded user flow. You are given the original test case description, the current test code, and the Playwright failure output (error message, stack trace, strict-mode violation details, etc), plus a diagnosed repair strategy for this failure below. Use the strategy as your primary lens, but if the actual failure output clearly points somewhere else, trust the output over the label.`;
 
-Diagnose the failure and produce a corrected version of the full test file. Likely causes, in rough order: (1) a selector that resolves to more than one element (strict mode violation) — if one of the matches is hidden/not visible (e.g. a responsive desktop/mobile duplicate, a collapsed accordion, an inactive tab), fix it by appending .filter({ visible: true }) to that locator, not .first()/.last()/.nth() — index-based picks are a coin flip that breaks again the moment DOM order changes, while a visible-only filter states the actual intent ("the one the user can see") and stays correct regardless of order; if instead every match is genuinely visible, that's a real ambiguity — fix it with a more specific role/name, a data-testid, or by scoping through a stable ancestor with .filter({ hasText: ... }); for an ambiguous form control (input / select / textarea, not a radio/checkbox), reach for page.locator('select[name="…"]') / page.locator('input[name="…"]') before any text-based locator — the name attribute is stabler than a <select>'s visible-text (its whole option list) and than a nearby label; (2) a click that resolved to an element that is present in the DOM but never becomes visible — this is usually the same hidden-duplicate situation as (1), not a timing problem, so prefer the visible filter over adding a wait; (3) a missing wait after an action that triggers navigation — add page.waitForURL(...), never a fixed sleep; (4) the application's actual behavior no longer matches what was recorded — this is not a test bug; (5) the target IS visible and the click starts, but the failure output says "element is not stable", "element was detached from the DOM, retrying", or the click times out inside its own retry loop — this is a re-render race, NOT a hidden duplicate and NOT an app regression: an onChange / async-validation handler on a field filled by an earlier step keeps rebuilding the subtree, so the resolved node is destroyed before the click lands. Fix it with both of: (a) commit the previously filled field so its re-render happens before this action, not during it — await page.locator('input[name="…"]').blur() (or a Tab press) on the last field the test filled; (b) wrap ONLY the flaky action in a re-resolving retry so a mid-click detach re-resolves the locator instead of failing: await expect(async () => { await <locator>.click({ timeout: 5000 }); }).toPass({ timeout: 30000 }); — and add await expect(<locator>).toBeEnabled() first if the button also toggles disabled while the form settles. If the app exposes a concrete settle signal (a specific validation response, a spinner leaving the DOM), await that too. Never use page.waitForTimeout. The locator itself is correct here — do not change it.
+// One block per branch of the Healing Strategy step — selected by
+// healingStrategy.ts's selectStrategy() from the classified failure, so the
+// model gets guidance targeted at the actual failure shape instead of one
+// undifferentiated list of every possible cause.
+const SELECTOR_REPAIR_GUIDANCE = `Diagnosed strategy: SELECTOR REPAIR — the locator resolved to zero elements, more than one element, or the expression itself is invalid. Likely causes: (1) a selector that resolves to more than one element (strict mode violation) — if one of the matches is hidden/not visible (e.g. a responsive desktop/mobile duplicate, a collapsed accordion, an inactive tab), fix it by appending .filter({ visible: true }) to that locator, not .first()/.last()/.nth() — index-based picks are a coin flip that breaks again the moment DOM order changes, while a visible-only filter states the actual intent ("the one the user can see") and stays correct regardless of order; if instead every match is genuinely visible, that's a real ambiguity — fix it with a more specific role/name, a data-testid, or by scoping through a stable ancestor with .filter({ hasText: ... }); for an ambiguous form control (input / select / textarea, not a radio/checkbox), reach for page.locator('select[name="…"]') / page.locator('input[name="…"]') before any text-based locator — the name attribute is stabler than a <select>'s visible-text (its whole option list) and than a nearby label; (2) a click that resolved to an element that is present in the DOM but never becomes visible — this is usually the same hidden-duplicate situation as (1), not a timing problem, so prefer the visible filter over adding a wait.`;
+
+const WAIT_RETRY_GUIDANCE = `Diagnosed strategy: WAIT/RETRY REPAIR — the locator resolved to exactly one element (or the failure is a plain timeout with no locator to blame), but the action itself didn't land. Likely cause: the target IS visible and the click starts, but the failure output says "element is not stable", "element was detached from the DOM, retrying", or the click times out inside its own retry loop — this is a re-render race, NOT a hidden duplicate and NOT an app regression: an onChange / async-validation handler on a field filled by an earlier step keeps rebuilding the subtree, so the resolved node is destroyed before the click lands. Fix it with both of: (a) commit the previously filled field so its re-render happens before this action, not during it — await page.locator('input[name="…"]').blur() (or a Tab press) on the last field the test filled; (b) wrap ONLY the flaky action in a re-resolving retry so a mid-click detach re-resolves the locator instead of failing: await expect(async () => { await <locator>.click({ timeout: 5000 }); }).toPass({ timeout: 30000 }); — and add await expect(<locator>).toBeEnabled() first if the button also toggles disabled while the form settles. If the app exposes a concrete settle signal (a specific validation response, a spinner leaving the DOM), await that too. Never use page.waitForTimeout. The locator itself is correct here — do not change it.
+
+Do not fix a failure by raising a timeout or retry budget more than once in a row. A single timeout increase can be a legitimate first hypothesis, but if that still fails, the problem is not "not enough time" — go find out what's actually happening (why the element isn't appearing/enabling, what state the app is really in) instead of raising the same number again; a second consecutive timing-only edit is rejected automatically.`;
+
+const NAVIGATION_REPAIR_GUIDANCE = `Diagnosed strategy: NAVIGATION REPAIR — the failure is a URL/page-load expectation not met. Likely cause: a missing wait after an action that triggers navigation — add page.waitForURL(...) using the pathname of the page the recording navigated to right after that action, never a fixed sleep.`;
+
+// Applies regardless of which strategy above is active.
+const GENERAL_GUIDANCE = `If the failure output shows the application genuinely did something different from what the recording expected (not a selector, wait/retry, or navigation problem) — a card renamed or removed, a label reworded, a different page reached — that is not a test bug, it's a real regression: call emit_fix with likelyRealBug true and explain what changed in the diagnosis.
 
 Invariants — do not paraphrase your way out of a failure. Any string that appears quoted in the test-case step or in that step's user intent, and any hasText / name / getByText / getByRole-name literal already present in the current (broken) locator, is a value you must keep. Fixing a locator by swapping one of these literals for a different one you found on the page (e.g. changing filter({ hasText: 'Warehouse Ace' }) to filter({ hasText: 'Ace Hardware' })) is never correct — it silently retargets the test. If no locator that preserves every such literal resolves to exactly one element, the app itself changed (a card renamed or removed, a label reworded): call emit_fix with likelyRealBug true and name the literal that no longer matches in the diagnosis.
 
-Make the smallest change that fixes the root cause. Do not weaken or delete an assertion just to make the test pass. Do not "fix" a locator by dropping scoping that was there for a reason (a container .filter({ hasText }) / .filter({ visible: true }) chain) just because a shorter bare locator happens to be unique on the page right now — repair the segment that actually broke and keep the chain. If the failure output shows the application genuinely did something different from what the recording expected (not a selector or timing problem), that is a real regression, not a broken test: call emit_fix with likelyRealBug true, and explain what changed in the diagnosis. Never use page.waitForTimeout.`;
+Make the smallest change that fixes the root cause. Do not weaken or delete an assertion just to make the test pass. Do not "fix" a locator by dropping scoping that was there for a reason (a container .filter({ hasText }) / .filter({ visible: true }) chain) just because a shorter bare locator happens to be unique on the page right now — repair the segment that actually broke and keep the chain. Never use page.waitForTimeout.`;
 
 // Unlike the old one-shot fixer (single call: "here's the error, rewrite the
 // file"), this prompt describes an agentic edit/run/observe loop — the model
 // tests its own fix for real via run_candidate_fix and keeps iterating off the
 // actual Playwright output, the same way Claude Code edits, runs, and reacts
 // to real results instead of guessing once.
-function buildFixSystemPrompt(hasBrowser: boolean): string {
+function strategyBlockFor(strategy: RepairStrategy): string {
+  switch (strategy) {
+    case 'selector-repair':
+      return SELECTOR_REPAIR_GUIDANCE;
+    case 'wait-retry-repair':
+      return WAIT_RETRY_GUIDANCE;
+    case 'navigation-repair':
+      return NAVIGATION_REPAIR_GUIDANCE;
+    // No single strategy fits (an assertion mismatch, or a failure shape we
+    // couldn't classify) — give all three so nothing is lost versus the old
+    // one-size-fits-all prompt.
+    case 'general-repair':
+    default:
+      return `${SELECTOR_REPAIR_GUIDANCE}\n\n${WAIT_RETRY_GUIDANCE}\n\n${NAVIGATION_REPAIR_GUIDANCE}`;
+  }
+}
+
+function buildFixSystemPrompt(hasBrowser: boolean, strategy: RepairStrategy): string {
   const browserBlock = hasBrowser
     ? `\n\nYou also have a LIVE headed browser parked on the page exactly as it is right before the failing step. Verify against it — do not guess:
 - try_locator({ expr }): read-only — evaluates a "page.*" locator against the live page (never clicks or fills; that's advance). Returns count (Playwright strict mode counts hidden matches too), visibleCount, and up to 5 matches in DOM order — each with tag / role / testId / id / ariaLabel / text / visible / inViewport / enabled, plus scopeHint (the nearest ancestor with a testId or a meaningful class, and its text). Use scopeHint to rebuild a SCOPED locator (ancestor.filter({ hasText }) then the leaf) rather than collapsing a broken chain to a bare getByText. truncated = matches not shown; invalidExpression = the expr itself is malformed, so count/matches mean nothing. THIS IS YOUR MAIN VERIFICATION TOOL — confirm a replacement locator matches exactly one element with it before putting it in run_candidate_fix's verifiedLocator field.
@@ -157,7 +191,11 @@ Which step actually failed: the Playwright failure output is authoritative. The 
 Iterate candidate locators with try_locator until one matches EXACTLY ONE element, preferring the recorder's priority order: getByTestId > getByRole with name > getByLabel > getByText > a locator scoped through a stable ancestor with .filter({ hasText }) or .filter({ visible: true }). Exception for form controls (input / select / textarea, excluding radio/checkbox): try page.locator('select[name="…"]') / page.locator('input[name="…"]') right after getByTestId and before any role-name or text strategy. When the failing locator is a scoped chain (ancestor .filter(...) then a leaf), keep the scoping: fix the segment that actually broke, don't replace the whole chain with a bare leaf that only happens to be unique on this page right now — use each match's scopeHint to find the ancestor to scope through.`
     : '';
 
-  return `${FIX_GUIDANCE}${browserBlock}
+  return `${FIX_INTRO}
+
+${strategyBlockFor(strategy)}
+
+${GENERAL_GUIDANCE}${browserBlock}
 
 You can test your fix for real instead of guessing once: call run_candidate_fix with the full corrected .spec.ts contents and a short diagnosis of what was wrong and what this change does. It writes the file and actually executes the Playwright test, then hands you back the real pass/fail result and output — read it and keep iterating (edit, run, observe) exactly like you would debugging code yourself. You do not need to ask permission to try again; keep calling run_candidate_fix until the test passes or you're told you're out of attempts. Only call emit_fix instead of running again when the failure is a genuine application regression that no test change can fix — set likelyRealBug true and explain what changed. Never call emit_fix to report success; the harness recognizes a passing run_candidate_fix on its own.`;
 }
@@ -278,20 +316,29 @@ export interface FixSessionParams {
   onRunResult: (attempt: number, passed: boolean, output: string) => void;
   onDiagnosis: (attempt: number, diagnosis: string, likelyRealBug: boolean) => void;
   onBrowserMessage?: (message: string) => void;
+  // Fires once with reason 'initial' when the session picks its starting
+  // strategy, again with 're-diagnosed' when a failed attempt's failure shape
+  // changed strategy, and with 'escalated' when it's stuck repeating the same
+  // strategy and the session pulled in historical recovery data.
+  onStrategy?: (attempt: number, strategy: RepairStrategy, reason: 'initial' | 're-diagnosed' | 'escalated') => void;
   browser?: BrowserFixSupport;
   signal?: AbortSignal;
 }
 
-// Pull the locator Playwright was actually stuck on out of a failure dump — the
-// "waiting for <locator>" line of a timeout call log, or the subject of a
-// strict-mode violation. This is ground truth for WHICH step broke; the replay
-// parking point is only a hint and can be a false positive.
-export function extractFailingLocator(output: string): string | undefined {
-  const strict = output.match(/strict mode violation:\s+(.+?)\s+resolved to \d+ element/);
-  if (strict) return strict[1].trim();
-  const waiting = output.match(/waiting for\s+(.+?)\s*(?:\n|$)/);
-  if (waiting) return waiting[1].trim();
-  return undefined;
+// Lives in failureClassifier.ts (pure, no SDK import); re-exported so existing
+// importers keep working.
+export { extractFailingLocator };
+
+// Failure Collector's console/network fan-in, formatted for the prompt.
+// Empty when the session has seen nothing worth reporting — most pages never
+// log an error, and a blank section would just be noise.
+function consoleNetworkBlock(session: HealingSession): string {
+  const consoleLog = session.recentConsoleLogs();
+  const networkErrors = session.recentNetworkErrors();
+  if (!consoleLog.length && !networkErrors.length) return '';
+  const consolePart = consoleLog.length ? `\nRecent console errors/warnings:\n${consoleLog.join('\n')}` : '';
+  const networkPart = networkErrors.length ? `\nRecent failed/error network responses:\n${networkErrors.join('\n')}` : '';
+  return `\n\nLive browser activity since the session started:${consolePart}${networkPart}`;
 }
 
 function buildInitialUserContent(
@@ -313,7 +360,7 @@ function buildInitialUserContent(
   const brokenContext = browser.brokenLocatorExpr
     ? `\n\nThe live browser was replayed to recorded action #${browser.actionIndex} (${browser.brokenAction?.action}). Parking reason: ${browser.breakSummary}.\nParked-step locator:\n${browser.brokenLocatorExpr}${intentLine}${authoritativeNote}\n\nRecorded element descriptor for that action:\n${JSON.stringify(browser.brokenAction?.element ?? {}, null, 2)}`
     : `\n\nThe replay reached recorded action #${browser.actionIndex} without a locator breaking; the failure is likely an assertion or timing issue at or after that point. The live browser is parked there.${intentLine}${authoritativeNote}`;
-  return `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}${brokenContext}`;
+  return `Test case:\n${JSON.stringify(testCase, null, 2)}\n\nCurrent code:\n${code}\n\nPlaywright failure output:\n${failureOutput}${brokenContext}${consoleNetworkBlock(browser.session)}`;
 }
 
 async function runBrowserProbeTool(
@@ -362,6 +409,22 @@ async function runBrowserProbeTool(
   }
 }
 
+// True when `after` differs from `before` only in numeric literals that are
+// Playwright/JS timing values (a `timeout:` option, or test.setTimeout(...) /
+// waitForTimeout(...)'s argument) — i.e. the "fix" is purely "wait longer",
+// with no other change to assertions, locators, or control flow. Guards
+// against a loop that repeatedly raises a number instead of finding the root
+// cause — observed in practice: 3 of 5 attempts in one session differed from
+// the last only by a bigger timeout, none of which fixed anything.
+function isOnlyTimingChange(before: string, after: string): boolean {
+  const stripTiming = (s: string) =>
+    s
+      .replace(/(\btimeout\s*:\s*)\d+/g, '$1<N>')
+      .replace(/(test\.setTimeout\(\s*)\d+/g, '$1<N>')
+      .replace(/(waitForTimeout\(\s*)\d+/g, '$1<N>');
+  return before.trim() !== after.trim() && stripTiming(before).trim() === stripTiming(after).trim();
+}
+
 // Turn budget beyond maxFixAttempts — covers browser-probing turns (try_locator,
 // aria_snapshot, ...) that don't themselves consume a run. Purely a safety net
 // against a model that never calls a recognized tool.
@@ -377,12 +440,29 @@ export async function runFixSession(params: FixSessionParams): Promise<FixSessio
   const { testCase, code: initialCode, failureOutput: initialFailure, maxFixAttempts, runCandidate, browser, signal } = params;
   const { onAttemptStart, onRunResult, onDiagnosis } = params;
   const onBrowserMessage = params.onBrowserMessage ?? (() => {});
+  const onStrategy = params.onStrategy ?? (() => {});
 
   let lastAttemptNumber = params.lastAttemptNumber;
   let lastFailedCode = initialCode;
+  // How many CONSECUTIVE failed attempts in a row were timing-only edits vs.
+  // the attempt before them. One is tolerated (a short timeout is a
+  // legitimate first hypothesis); a second in a row is rejected below.
+  let timingOnlyStreak = 0;
   let currentBreak = browser ? { actionIndex: browser.actionIndex } : undefined;
 
-  const systemPrompt = buildFixSystemPrompt(!!browser);
+  // The Healing Strategy step: classify the failure that triggered this
+  // session and pick which repair guidance the system prompt leads with.
+  const initialBrk: BreakPoint | undefined = browser
+    ? { actionIndex: browser.actionIndex, brokenAction: browser.brokenAction, brokenLocatorExpr: browser.brokenLocatorExpr }
+    : undefined;
+  let currentStrategy: RepairStrategy = selectStrategy(classifyFailure(initialFailure, initialBrk));
+  // How many CONSECUTIVE failed attempts in a row landed on the same
+  // strategy as the one before them — the trigger for escalating to
+  // historical recovery data instead of just re-diagnosing from scratch.
+  let sameStrategyStreak = 0;
+  onStrategy(lastAttemptNumber, currentStrategy, 'initial');
+
+  let systemPrompt = buildFixSystemPrompt(!!browser, currentStrategy);
   const tools = (browser ? [RUN_CANDIDATE_TOOL, EMIT_FIX_TOOL, ...BROWSER_PROBE_TOOLS] : [RUN_CANDIDATE_TOOL, EMIT_FIX_TOOL]) as unknown as Anthropic.Tool[];
   const messages: Anthropic.MessageParam[] = [
     { role: 'user', content: buildInitialUserContent(testCase, initialCode, initialFailure, browser) },
@@ -418,6 +498,17 @@ export async function runFixSession(params: FixSessionParams): Promise<FixSessio
       if (t.name === 'run_candidate_fix') {
         const { code, diagnosis, verifiedLocator } = t.input as { code: string; diagnosis: string; verifiedLocator?: string };
 
+        const validation = validateSpecCode(code);
+        if (!validation.valid) {
+          results.push({
+            type: 'tool_result',
+            tool_use_id: t.id,
+            content: `This is not a valid, runnable .spec.ts file — rejected before running it: ${validation.errors.join('; ')}. Emit the FULL corrected file contents (imports included), not a fragment or diff.`,
+            is_error: true,
+          });
+          continue;
+        }
+
         if (code.trim() === lastFailedCode.trim()) {
           results.push({
             type: 'tool_result',
@@ -426,6 +517,17 @@ export async function runFixSession(params: FixSessionParams): Promise<FixSessio
               attemptsUsed === 0
                 ? `This is byte-identical to the code that already failed — running it again would fail the same way. Try a different approach, or call emit_fix if this is a genuine app regression.`
                 : `This is byte-identical to the code from attempt ${lastAttemptNumber}, which already failed — running it again would fail the same way. Try a different approach, or call emit_fix if this is a genuine app regression.`,
+            is_error: true,
+          });
+          continue;
+        }
+
+        const timingOnly = isOnlyTimingChange(lastFailedCode, code);
+        if (timingOnly && timingOnlyStreak >= 1) {
+          results.push({
+            type: 'tool_result',
+            tool_use_id: t.id,
+            content: `This only raises a timeout/retry-budget number again — the same kind of edit that already failed last attempt without fixing anything. Increasing a timeout twice in a row is not a diagnosis. Find the actual root cause${browser ? ' — use try_locator / aria_snapshot / get_html / screenshot to see what the live page is really doing while this fails' : ''} and propose a structurally different fix, or call emit_fix if you believe this is a genuine app regression.`,
             is_error: true,
           });
           continue;
@@ -476,6 +578,7 @@ export async function runFixSession(params: FixSessionParams): Promise<FixSessio
         }
 
         lastFailedCode = code;
+        timingOnlyStreak = timingOnly ? timingOnlyStreak + 1 : 0;
 
         if (attemptsUsed >= maxFixAttempts) {
           console.log(`[anthropic] fix session exhausted maxFixAttempts (${maxFixAttempts}) — stopping`);
@@ -484,19 +587,56 @@ export async function runFixSession(params: FixSessionParams): Promise<FixSessio
         }
 
         let resyncNote = '';
+        let resyncedBrk: { brokenAction?: RecordedAction; brokenLocatorExpr?: string } | undefined;
         if (browser) {
           const resynced = await browser.resync(runResult.output);
           if (resynced) {
             currentBreak = { actionIndex: resynced.actionIndex };
             resyncNote = `\n\n${resynced.message}`;
             onBrowserMessage(resynced.message);
+            resyncedBrk = { brokenAction: resynced.brokenAction, brokenLocatorExpr: resynced.brokenLocatorExpr };
           }
         }
 
+        // Escalate / Re-diagnose: reclassify this failure and see whether the
+        // repair strategy should change (a re-diagnose) or the loop is stuck
+        // repeating the same one (an escalation into past recovery data).
+        const reclassifyBrk: BreakPoint | undefined = browser
+          ? {
+              actionIndex: currentBreak?.actionIndex ?? browser.actionIndex,
+              brokenAction: resyncedBrk?.brokenAction ?? browser.brokenAction,
+              brokenLocatorExpr: resyncedBrk?.brokenLocatorExpr ?? browser.brokenLocatorExpr,
+            }
+          : undefined;
+        const newSignature = classifyFailure(runResult.output, reclassifyBrk);
+        const newStrategy = selectStrategy(newSignature);
+        let strategyNote = '';
+        if (newStrategy !== currentStrategy) {
+          console.log(`[anthropic] re-diagnosing — strategy changed ${currentStrategy} -> ${newStrategy}`);
+          strategyNote = `\n\nFailure shape changed — switching from ${currentStrategy} to ${newStrategy}.`;
+          currentStrategy = newStrategy;
+          systemPrompt = buildFixSystemPrompt(!!browser, currentStrategy);
+          sameStrategyStreak = 0;
+          onStrategy(lastAttemptNumber, currentStrategy, 're-diagnosed');
+        } else {
+          sameStrategyStreak++;
+          if (sameStrategyStreak >= 1) {
+            const similar = findSimilarRecoveries(newSignature);
+            if (similar.length) {
+              const best = similar[0];
+              strategyNote = `\n\nEscalating — this is the ${sameStrategyStreak + 1}th failure in a row diagnosed as ${currentStrategy}. A past heal fixed a similar failure (${best.signature.kind}) by removing: ${JSON.stringify(best.removedLines)} and adding: ${JSON.stringify(best.addedLines)}. Consider whether the same kind of change applies here — but only if it actually fits this locator/output, do not copy it blindly.`;
+            } else {
+              strategyNote = `\n\nEscalating — this is the ${sameStrategyStreak + 1}th failure in a row diagnosed as ${currentStrategy} with no matching past fix on record. Reconsider whether ${currentStrategy} is really the right diagnosis before trying another variation of the same kind of change.`;
+            }
+            onStrategy(lastAttemptNumber, currentStrategy, 'escalated');
+          }
+        }
+
+        const freshActivity = browser ? consoleNetworkBlock(browser.session) : '';
         results.push({
           type: 'tool_result',
           tool_use_id: t.id,
-          content: `Failed (${maxFixAttempts - attemptsUsed} attempt(s) left). Output:\n${runResult.output}${resyncNote}`,
+          content: `Failed (${maxFixAttempts - attemptsUsed} attempt(s) left). Output:\n${runResult.output}${resyncNote}${strategyNote}${freshActivity}`,
         });
         continue;
       }

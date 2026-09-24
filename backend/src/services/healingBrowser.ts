@@ -31,6 +31,10 @@ const ARTIFACT_DIR = path.resolve('test-results', 'heal');
 const SNAPSHOT_CHARS = 8000;
 const HTML_CHARS = 4000;
 const MAX_MATCH_DETAIL = 5;
+// Failure Collector's console/network fan-in: a ring buffer per session, not
+// a full transcript — the fixer needs "what's wrong right now", not a log of
+// everything the page ever printed.
+const MAX_LOG_LINES = 30;
 
 export interface ProbeMatch {
   tag: string;
@@ -109,6 +113,12 @@ export interface HealingSession {
   /** Perform one action against the live page (to reach a state further along). */
   advance(kind: 'click' | 'fill' | 'select', expr: string, value?: string): Promise<string>;
   screenshot(label: string): Promise<string>;
+  /** Console errors/warnings and uncaught page errors seen since the session
+   *  started, most recent last (capped ring buffer). */
+  recentConsoleLogs(): string[];
+  /** Failed requests and 4xx/5xx responses seen since the session started,
+   *  most recent last (capped ring buffer). */
+  recentNetworkErrors(): string[];
   /** Keep the window open after teardown() would normally run (give-up path). */
   park(): void;
   teardown(): Promise<void>;
@@ -227,6 +237,23 @@ export async function getSession(): Promise<HealingSession> {
   const browser = await chromium.launch({ headless: !HEADED, slowMo: SLOW_MO_MS });
   const context = await browser.newContext();
   const page = await context.newPage();
+
+  const consoleLog: string[] = [];
+  const networkErrors: string[] = [];
+  const pushCapped = (buf: string[], line: string) => {
+    buf.push(line);
+    if (buf.length > MAX_LOG_LINES) buf.shift();
+  };
+  page.on('console', (msg) => {
+    if (msg.type() === 'error' || msg.type() === 'warning') pushCapped(consoleLog, `[${msg.type()}] ${msg.text()}`);
+  });
+  page.on('pageerror', (err) => pushCapped(consoleLog, `[pageerror] ${err.message}`));
+  page.on('requestfailed', (req) => {
+    pushCapped(networkErrors, `${req.method()} ${req.url()} — ${req.failure()?.errorText ?? 'failed'}`);
+  });
+  page.on('response', (res) => {
+    if (res.status() >= 400) pushCapped(networkErrors, `${res.status()} ${res.request().method()} ${res.url()}`);
+  });
 
   const session: InternalSession = {
     _browser: browser,
@@ -381,6 +408,14 @@ export async function getSession(): Promise<HealingSession> {
       const file = path.join(ARTIFACT_DIR, `${Date.now()}-${safe}.png`);
       await page.screenshot({ path: file, fullPage: false });
       return file;
+    },
+
+    recentConsoleLogs() {
+      return [...consoleLog];
+    },
+
+    recentNetworkErrors() {
+      return [...networkErrors];
     },
 
     park() {

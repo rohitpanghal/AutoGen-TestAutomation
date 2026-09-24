@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { generateTest } from '../services/anthropic.js';
+import { validateSpecCode } from '../services/scriptValidator.js';
 import { enrichActions } from '../services/locatorBuilder.js';
 import { saveRecording, saveGeneratedTest } from '../services/storage.js';
 import { enqueue, type JobContext } from '../services/jobs.js';
@@ -126,6 +127,14 @@ async function runGenerateJob(ctx: JobContext, input: GenerateJobInput) {
     console.warn(
       `[generate] (${id}) testCase claims ${testCase.expectedResults.length} expected result(s) but playwrightCode has 0 expect() calls`
     );
+  }
+
+  // Same "verify the LLM's claim" backstop as above — a generated file that
+  // doesn't even parse would otherwise only surface later, as an opaque
+  // compile failure on the first heal run.
+  const scriptValidation = validateSpecCode(playwrightCode);
+  if (!scriptValidation.valid) {
+    console.warn(`[generate] (${id}) generated playwrightCode is not a valid spec file: ${scriptValidation.errors.join('; ')}`);
   }
 
   const specFile = saveGeneratedTest(id, testCase, playwrightCode);

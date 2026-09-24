@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { loadGeneratedTest, loadRecording, updateGeneratedTest } from '../services/storage.js';
 import { healTest, MAX_HEAL_ATTEMPTS } from '../services/healingGraph.js';
+import { validateSpecCode } from '../services/scriptValidator.js';
 import { enqueue, type JobContext } from '../services/jobs.js';
 import type { RecordedAction } from '../types.js';
 
@@ -27,14 +28,35 @@ async function runHealJob(ctx: JobContext, input: HealJobInput) {
     testCase: record.testCase,
     code: record.playwrightCode,
     specFile: record.specFile,
+    testId: input.recordId,
     maxAttempts: input.maxAttempts,
     recordedActions: recording?.actions,
     signal: ctx.signal,
     onEvent: (ev) => ctx.emit(ev.type, ev),
   });
 
+  // A passing result only ever got here by actually executing via Playwright
+  // (or the original code passed untouched), so it's provably a runnable
+  // script. A non-passing "best effort" result is whatever the fix session
+  // ended on — validate it before it ever overwrites the real spec file, so a
+  // heal that didn't converge can never leave the user with a script that
+  // doesn't even parse.
+  let codeToPersist = result.code;
   if (result.code !== record.playwrightCode) {
-    updateGeneratedTest(input.recordId, { playwrightCode: result.code });
+    if (result.status === 'passed') {
+      updateGeneratedTest(input.recordId, { playwrightCode: result.code });
+    } else {
+      const validation = validateSpecCode(result.code);
+      if (validation.valid) {
+        updateGeneratedTest(input.recordId, { playwrightCode: result.code });
+      } else {
+        console.warn(
+          `[heal] (${input.recordId}) final code is not a valid spec file — keeping the original on disk: ${validation.errors.join('; ')}`
+        );
+        ctx.emit('heal:browser', { message: `Healing did not converge on a valid script — keeping the previous version on disk.` });
+        codeToPersist = record.playwrightCode;
+      }
+    }
   }
 
   const done = {
@@ -42,7 +64,7 @@ async function runHealJob(ctx: JobContext, input: HealJobInput) {
     testCase: record.testCase,
     specFile: record.specFile,
     working: result.status === 'passed',
-    finalCode: result.code,
+    finalCode: codeToPersist,
     healing: {
       status: result.status,
       attempts: result.attempt,

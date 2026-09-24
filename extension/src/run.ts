@@ -342,6 +342,18 @@ function attach(id: string) {
     logLine(d.message);
   });
 
+  source.addEventListener('heal:strategy', (e) => {
+    const d = JSON.parse((e as MessageEvent).data) as {
+      attempt: number;
+      strategy: 'selector-repair' | 'wait-retry-repair' | 'navigation-repair' | 'general-repair';
+      reason: 'initial' | 're-diagnosed' | 'escalated';
+    };
+    const label = d.strategy.replace(/-/g, ' ');
+    if (d.reason === 'initial') logLine(`Attempt ${d.attempt}: diagnosed as ${label}.`);
+    else if (d.reason === 're-diagnosed') logLine(`Attempt ${d.attempt}: re-diagnosed — switching to ${label}.`);
+    else logLine(`Attempt ${d.attempt}: escalating — repeated ${label} failure, checking past fixes…`);
+  });
+
   source.addEventListener('done', (e) => {
     const d = JSON.parse((e as MessageEvent).data) as DonePayload;
     receivedAny = true;

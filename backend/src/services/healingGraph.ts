@@ -18,6 +18,9 @@ import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
 import { runPlaywrightTest } from './testRunner.js';
 import { runFixSession, extractFailingLocator, type FixSessionParams, type FixSessionResult, type BrowserFixSupport } from './anthropic.js';
 import { getSession, type BreakPoint, type HealingSession } from './healingBrowser.js';
+import { classifyFailure, type FailureSignature } from './failureClassifier.js';
+import { appendRecovery, diffLines } from './recoveryStore.js';
+import type { RepairStrategy } from './healingStrategy.js';
 import type { GeneratedTestCase, RecordedAction } from '../types.js';
 import type { TestRunResult } from './testRunner.js';
 
@@ -34,7 +37,14 @@ export type HealEvent =
   | { type: 'heal:attempt-start'; attempt: number; maxAttempts: number }
   | { type: 'heal:run-result'; attempt: number; passed: boolean; outputTail: string }
   | { type: 'heal:diagnosis'; attempt: number; diagnosis: string; likelyRealBug: boolean }
-  | { type: 'heal:browser'; message: string };
+  | { type: 'heal:browser'; message: string }
+  // The Healing Strategy step: which repair strategy is active, and why it's
+  // being reported now — the initial diagnosis, a switch after the failure
+  // shape changed (re-diagnose), or a repeat of the same strategy (escalate).
+  | { type: 'heal:strategy'; attempt: number; strategy: RepairStrategy; reason: 'initial' | 're-diagnosed' | 'escalated' }
+  // Emitted once per heal session that started from a failing run, after the
+  // outcome has been appended to the recovery store.
+  | { type: 'heal:recorded'; recoveryId: string; signature: FailureSignature };
 
 const OUTPUT_TAIL_CHARS = 2000;
 const noopEvent = (_ev: HealEvent): void => {};
@@ -85,7 +95,10 @@ export interface HealingGraphDeps {
 
 function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = noopEvent) {
   async function runNode(state: HealStateType): Promise<Partial<HealStateType>> {
-    onEvent({ type: 'heal:attempt-start', attempt: state.attempt + 1, maxAttempts: state.maxAttempts });
+    // Displayed denominator is the total run budget (this initial run plus
+    // every fix attempt), not just state.maxAttempts (the fix budget alone) —
+    // otherwise the last fix attempt shows as e.g. "5/4" (see fixNode).
+    onEvent({ type: 'heal:attempt-start', attempt: state.attempt + 1, maxAttempts: state.maxAttempts + 1 });
     // Always run off the scratch copy, never the real specFile — the fix
     // session only updates state.code in memory, and writing each attempt to
     // the file the user has open would flicker/overwrite it on every
@@ -137,11 +150,12 @@ function buildGraph(deps: HealingGraphDeps, onEvent: (ev: HealEvent) => void = n
       maxFixAttempts: state.maxAttempts,
       lastAttemptNumber: state.attempt + 1,
       runCandidate,
-      onAttemptStart: (attempt) => onEvent({ type: 'heal:attempt-start', attempt, maxAttempts: state.maxAttempts }),
+      onAttemptStart: (attempt) => onEvent({ type: 'heal:attempt-start', attempt, maxAttempts: state.maxAttempts + 1 }),
       onRunResult: (attempt, passed, output) =>
         onEvent({ type: 'heal:run-result', attempt, passed, outputTail: output.slice(-OUTPUT_TAIL_CHARS) }),
       onDiagnosis: (attempt, diagnosis, likelyRealBug) => onEvent({ type: 'heal:diagnosis', attempt, diagnosis, likelyRealBug }),
       onBrowserMessage: (message) => onEvent({ type: 'heal:browser', message }),
+      onStrategy: (attempt, strategy, reason) => onEvent({ type: 'heal:strategy', attempt, strategy, reason }),
     });
     console.log(`[heal] fix session ended — status=${session.status}, likelyRealBug=${session.likelyRealBug}, runs=${session.history.length}`);
     return {
@@ -167,6 +181,8 @@ export interface HealInput {
   testCase: GeneratedTestCase;
   code: string;
   specFile: string;
+  // Stored-test id, recorded with the recovery so a heal can be traced back.
+  testId?: string;
   maxAttempts?: number;
   // The enriched recording this test was generated from. When present, healTest
   // spins up a live headed browser, replays the flow to the broken step, and
@@ -196,6 +212,40 @@ function sweepStaleScratch(dir: string) {
   }
 }
 
+// Append this session's outcome to the recovery store. A run that passed first
+// time has nothing to learn from, and a memory write must never fail a heal.
+function recordRecovery(
+  input: HealInput,
+  state: HealStateType,
+  firstBreak: BreakPoint | undefined,
+  onEvent: (ev: HealEvent) => void
+) {
+  const first = state.history[0];
+  if (!first || first.passed) return;
+  try {
+    const signature = classifyFailure(first.output, firstBreak);
+    const { removedLines, addedLines } = diffLines(input.code, state.code);
+    const recoveryId = nanoid(10);
+    appendRecovery({
+      id: recoveryId,
+      createdAt: new Date().toISOString(),
+      testId: input.testId,
+      testTitle: input.testCase.title,
+      signature,
+      outcome: state.status === 'passed' ? 'passed' : state.suspectedRealBug ? 'real-bug' : 'failed',
+      attempts: state.history.length,
+      removedLines,
+      addedLines,
+      strategy: null,
+      usedLiveBrowser: Boolean(firstBreak),
+    });
+    console.log(`[heal] recorded recovery ${recoveryId} — ${signature.kind}, outcome=${state.status}`);
+    onEvent({ type: 'heal:recorded', recoveryId, signature });
+  } catch (err) {
+    console.warn(`[heal] could not record recovery: ${(err as Error).message}`);
+  }
+}
+
 export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps): Promise<HealStateType> {
   const dir = path.dirname(input.specFile);
   const fileName = path.basename(input.specFile);
@@ -212,6 +262,9 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
   // Build the live-browser fixer deps unless the caller injected their own
   // (tests) or gave us no recording to replay.
   let session: HealingSession | undefined;
+  // The break point the FIRST replay parked at — the runtime state that goes
+  // into the failure signature. Later re-syncs don't overwrite it.
+  let firstBreak: BreakPoint | undefined;
   let deps: HealingGraphDeps = depsOverride ?? {
     run: (specFile) => runPlaywrightTest(specFile, signal),
     fix: (params) => runFixSession({ ...params, signal }),
@@ -227,6 +280,7 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
     const workingActions = [...input.recordedActions];
     onEvent({ type: 'heal:browser', message: 'Replaying the recorded flow in a live browser…' });
     let brk: BreakPoint = await session.replayUntilBroken(workingActions);
+    firstBreak = brk;
     let breakSummary = breakPhrase(brk);
     const parkedMsg = (b: BreakPoint, summary: string) =>
       `Replay parked at recorded step #${b.actionIndex} — ${summary}` + (b.brokenLocatorExpr ? `: ${b.brokenLocatorExpr}` : '');
@@ -297,6 +351,7 @@ export async function healTest(input: HealInput, depsOverride?: HealingGraphDeps
     });
     return finalState;
   } finally {
+    if (finalState && !depsOverride) recordRecovery(input, finalState, firstBreak, onEvent);
     if (existsSync(scratchFile)) unlinkSync(scratchFile);
     if (session) {
       if (finalState?.status === 'passed') {
